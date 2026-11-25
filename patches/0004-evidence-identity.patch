@@ -1,0 +1,1239 @@
+From 355e33114cdd71820b8e0fb072213821bfbec092 Mon Sep 17 00:00:00 2001
+From: Vela <vela@hermes.local>
+Date: Wed, 25 Nov 2026 18:31:14 +0100
+Subject: [PATCH] fix(belief): stable observation identity, so repeated
+ evidence revises instead of voting twice
+
+assert_evidence had no notion of WHAT was observed: every call appended a trail
+entry and added to log_odds. Asserting the same evidence twice doubled the
+log-odds (0.90 -> 1.80).
+
+Three rules for the identity, composed by the caller via observation_key():
+
+* WITHOUT the provenance kind - the same observation does not become a new one
+  by being re-classified (observed vs extracted vs told);
+* WITHOUT the timestamp - a re-import, a consolidation or a corrected clock
+  must not turn one observation into two;
+* WITH a local key - one source can carry several independent observations, so
+  the caller names the one it means; without it the source counts as one.
+
+Belief::update_with_id replaces the weight of an existing observation and moves
+the previous (weight, timestamp) into EvidenceEntry.history, so the current
+state and its development stay distinguishable. Re-assessing the same
+observation with a weaker provenance changes the VALUE, never the identity.
+
+Measured (engine/tests/evidence_identity_semantics.rs, belief_lifecycle.rs):
+  same id               0.9000 -> 0.9000, trail 1
+  one source, two keys  trail 2, 0.9000
+  provenance change     trail 1, value 0.5000 -> 0.3750, history kept
+  without id            0.9000 -> 1.8000 (unchanged behaviour)
+
+Invariant, stated precisely: log_odds == prior + sum(weights) while no ceiling
+or decay applies; the ceiling clamps (6.0 vs sum 18.0), which is documented
+behaviour, not a defect.
+
+Suite: 2295 passed, 0 failed, 8 ignored (2 = known decay defects).
+---
+ .../examples/belief_from_pattern.rs           |  97 ++++++++++
+ .../examples/belief_lifecycle.rs              |  98 ++++++++++
+ crates/yantrikdb-core/src/cognition/belief.rs |  40 +++-
+ .../src/cognition/belief_query.rs             |  14 ++
+ .../yantrikdb-core/src/cognition/benchmark.rs |  15 ++
+ .../src/cognition/contradiction.rs            |   2 +
+ crates/yantrikdb-core/src/cognition/state.rs  |  51 ++++++
+ crates/yantrikdb-core/src/engine/belief.rs    |   5 +
+ .../engine/tests/belief_decay_semantics.rs    | 108 +++++++++++
+ .../src/engine/tests/belief_lifecycle.rs      | 171 ++++++++++++++++++
+ .../src/engine/tests/belief_propagation.rs    | 120 ++++++++++++
+ .../tests/evidence_identity_semantics.rs      | 137 ++++++++++++++
+ crates/yantrikdb-core/src/engine/tests/mod.rs |   5 +
+ 13 files changed, 862 insertions(+), 1 deletion(-)
+ create mode 100644 crates/yantrikdb-core/examples/belief_from_pattern.rs
+ create mode 100644 crates/yantrikdb-core/examples/belief_lifecycle.rs
+ create mode 100644 crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
+ create mode 100644 crates/yantrikdb-core/src/engine/tests/belief_lifecycle.rs
+ create mode 100644 crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
+ create mode 100644 crates/yantrikdb-core/src/engine/tests/evidence_identity_semantics.rs
+
+diff --git a/crates/yantrikdb-core/examples/belief_from_pattern.rs b/crates/yantrikdb-core/examples/belief_from_pattern.rs
+new file mode 100644
+index 0000000..ca019dc
+--- /dev/null
++++ b/crates/yantrikdb-core/examples/belief_from_pattern.rs
+@@ -0,0 +1,97 @@
++//! Erkenntniskreislauf: Cluster-Mitglieder -> Belief -> Bestätigung -> Widerspruch.
++//!
++//! cargo run --release --example belief_from_pattern -- <db-path> <spec.json>
++//!
++//! spec.json: {"proposition": "...", "rids": ["...", ...], "contradiction": "..."}
++//!
++//! Die Mitglieder sind die Evidenz (ein Eintrag je Record), die Proposition ist
++//! aus dem Cluster abgeleitet. Danach eine widersprechende Beobachtung.
++
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use yantrikdb::belief::{assert_evidence, BeliefRevisionConfig, Evidence};
++use yantrikdb::state::{BeliefPayload, Provenance};
++use yantrikdb::{CognitiveNode, NodeId, NodeKind, NodePayload, YantrikDB};
++
++fn now() -> f64 {
++    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
++}
++fn sigmoid(l: f64) -> f64 { 1.0 / (1.0 + (-l).exp()) }
++
++fn main() {
++    let mut args = std::env::args().skip(1);
++    let path = args.next().expect("usage: <db> <spec.json>");
++    let spec_path = args.next().expect("usage: <db> <spec.json>");
++
++    let raw = std::fs::read_to_string(&spec_path).expect("read spec");
++    let spec: serde_json::Value = serde_json::from_str(&raw).expect("parse spec");
++    let proposition = spec["proposition"].as_str().expect("proposition").to_string();
++    let rids: Vec<String> = spec["rids"].as_array().expect("rids")
++        .iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect();
++    let contradiction = spec["contradiction"].as_str().unwrap_or("").to_string();
++
++    let db = YantrikDB::new(&path, 1024).expect("open copy");
++    let id = NodeId::new(NodeKind::Belief, 1);
++
++    let mut node = CognitiveNode::new(
++        id,
++        "pattern-derived".to_string(),
++        NodePayload::Belief(BeliefPayload {
++            proposition: proposition.clone(),
++            log_odds: 0.0,
++            domain: "general".to_string(),
++            evidence_trail: Vec::new(),
++            user_confirmed: false,
++        }),
++    );
++    db.persist_cognitive_node(&node).expect("persist");
++    println!("BELIEF proposition={:?}", &proposition.chars().take(90).collect::<String>());
++    println!("BELIEF start log_odds=0.0000 p_true=0.5000");
++
++    let cfg = BeliefRevisionConfig::default();
++
++    // Ein Evidenzeintrag je Cluster-Mitglied: die Beobachtung ist die Quelle, nicht eine Zahl.
++    let per_member = 0.35; // festes Gewicht JE unabhaengigem Beleg
++    for r in &rids {
++        let ev = Evidence {
++            target_belief: id,
++            weight: per_member,
++            source: format!("cluster member {r}"),
++            provenance: Provenance::Observed,
++            propagate: false,
++            timestamp: now(),
++            observation_id: None,
++        };
++        let _ = assert_evidence(&mut node, &ev, &cfg);
++    }
++    let after_support = match &node.payload { NodePayload::Belief(b) => b.log_odds, _ => 0.0 };
++    db.persist_cognitive_node(&node).expect("persist support");
++    println!("SUPPORT n={} je {:+.3} -> log_odds {:.4} p_true={:.4}",
++             rids.len(), per_member, after_support, sigmoid(after_support));
++
++    if !contradiction.is_empty() {
++        let ev = Evidence {
++            target_belief: id,
++            weight: -1.5,
++            source: contradiction.clone(),
++            provenance: Provenance::Observed,
++            propagate: false,
++            timestamp: now(),
++            observation_id: None,
++        };
++        let _ = assert_evidence(&mut node, &ev, &cfg);
++        let after_contra = match &node.payload { NodePayload::Belief(b) => b.log_odds, _ => 0.0 };
++        db.persist_cognitive_node(&node).expect("persist contradict");
++        println!("CONTRA weight=-1.5 ({:?}) -> log_odds {:.4} p_true={:.4}",
++                 &contradiction.chars().take(50).collect::<String>(), after_contra, sigmoid(after_contra));
++    }
++
++    let node2 = db.load_cognitive_node(id).unwrap().expect("reload");
++    let p = match &node2.payload { NodePayload::Belief(b) => b, _ => panic!() };
++    println!("FINAL log_odds={:.4} p_true={:.4} trail={} beliefs={:?}",
++             p.log_odds, sigmoid(p.log_odds), p.evidence_trail.len(),
++             db.count_cognitive_nodes(Some(NodeKind::Belief)).unwrap());
++    if let Ok(Some(exp)) = db.explain_belief(id) {
++        println!("EXPLAIN {:?}", format!("{exp:?}").chars().take(200).collect::<String>());
++    }
++}
+diff --git a/crates/yantrikdb-core/examples/belief_lifecycle.rs b/crates/yantrikdb-core/examples/belief_lifecycle.rs
+new file mode 100644
+index 0000000..c93cb09
+--- /dev/null
++++ b/crates/yantrikdb-core/examples/belief_lifecycle.rs
+@@ -0,0 +1,98 @@
++//! Native lifecycle of a `CognitiveNode(Belief)` — on a scratch copy only.
++//!
++//! cargo run --release --example belief_lifecycle -- <db-path> create|reopen
++//!
++//! create: erzeugt den Knoten, ordnet bestätigende und widersprechende Evidenz
++//!         zu, persistiert nach jedem Schritt und gibt die Log-Odds aus.
++//! reopen: liest den Knoten in einem NEUEN Prozess aus derselben Datei,
++//!         fragt ihn ab und lässt ihn erklären — der Persistenzbeweis.
++
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use yantrikdb::belief::{assert_evidence, BeliefRevisionConfig, Evidence};
++use yantrikdb::state::BeliefPayload;
++use yantrikdb::state::Provenance;
++use yantrikdb::{CognitiveNode, NodeId, NodeKind, NodePayload, YantrikDB};
++
++const PROPOSITION: &str =
++    "A2A-Zustimmung ist ein wiederkehrendes Thema: Agenten stimmen Ablauf und Zustimmung ab, \
++     bevor Nachrichten fliessen.";
++
++fn now() -> f64 {
++    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
++}
++
++fn sigmoid(l: f64) -> f64 {
++    1.0 / (1.0 + (-l).exp())
++}
++
++fn main() {
++    let path = std::env::args().nth(1).expect("usage: belief_lifecycle <db> create|reopen");
++    let mode = std::env::args().nth(2).unwrap_or_else(|| "create".into());
++
++    let db = YantrikDB::new(&path, 1024).expect("open scratch copy");
++    let id = NodeId::new(NodeKind::Belief, 1);
++
++    match mode.as_str() {
++        "reopen" => {
++            let node = db.load_cognitive_node(id).expect("load").expect("node present");
++            let p = match &node.payload {
++                NodePayload::Belief(b) => b,
++                _ => panic!("not a belief"),
++            };
++            println!("REOPEN present=true proposition={:?}", &p.proposition[..40.min(p.proposition.len())]);
++            println!("REOPEN log_odds={:.4} p_true={:.4} evidence_trail={}", p.log_odds, sigmoid(p.log_odds), p.evidence_trail.len());
++            println!("REOPEN count_beliefs={:?}", db.count_cognitive_nodes(Some(NodeKind::Belief)).unwrap());
++            if let Ok(Some(exp)) = db.explain_belief(id) {
++                println!("REOPEN explain={:?}", format!("{exp:?}").chars().take(220).collect::<String>());
++            } else {
++                println!("REOPEN explain=<none>");
++            }
++        }
++        _ => {
++            let mut node = CognitiveNode::new(
++                id,
++                "a2a-zustimmung".to_string(),
++                NodePayload::Belief(BeliefPayload {
++                    proposition: PROPOSITION.to_string(),
++                    log_odds: 0.0,
++                    domain: "general".to_string(),
++                    evidence_trail: Vec::new(),
++                    user_confirmed: false,
++                }),
++            );
++            db.persist_cognitive_node(&node).expect("persist creation");
++            println!("CREATE persisted log_odds=0.0000 p_true=0.5000");
++
++            let cfg = BeliefRevisionConfig::default();
++            for (weight, source) in [(1.4_f64, "20 Topic-Cluster-Mitglieder, 25 Tage"),
++                                     (1.1, "zweiter Lauf, unveraenderte Evidenz"),
++                                     (-1.3, "widersprechender Record: A2A abgeschaltet")] {
++                let ev = Evidence {
++                    target_belief: id,
++                    weight,
++                    source: source.to_string(),
++                    provenance: Provenance::Inferred,
++                    propagate: false,
++                    timestamp: now(),
++                    observation_id: None,
++                };
++                let before = match &node.payload {
++                    NodePayload::Belief(b) => b.log_odds,
++                    _ => 0.0,
++                };
++                match assert_evidence(&mut node, &ev, &cfg) {
++                    Some(_) => {
++                        let after = match &node.payload {
++                            NodePayload::Belief(b) => b.log_odds,
++                            _ => 0.0,
++                        };
++                        db.persist_cognitive_node(&node).expect("persist evidence");
++                        println!("EVIDENCE weight={weight:+.1} log_odds {before:.4} -> {after:.4} p_true={:.4}", sigmoid(after));
++                    }
++                    None => println!("EVIDENCE weight={weight:+.1} REJECTED"),
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/yantrikdb-core/src/cognition/belief.rs b/crates/yantrikdb-core/src/cognition/belief.rs
+index cf0500d..751e2dd 100644
+--- a/crates/yantrikdb-core/src/cognition/belief.rs
++++ b/crates/yantrikdb-core/src/cognition/belief.rs
+@@ -44,6 +44,10 @@ pub struct Evidence {
+     pub propagate: bool,
+     /// When this evidence was observed (unix timestamp seconds).
+     pub timestamp: f64,
++    /// Stable identity of the observation, when the caller can name one
++    /// (belief + original source + provenance). Same id = same observation:
++    /// it revises the previous effect instead of voting twice.
++    pub observation_id: Option<String>,
+ }
+ 
+ /// Result of asserting a piece of evidence.
+@@ -176,6 +180,27 @@ impl Default for BeliefRevisionConfig {
+ /// * `config` - Revision configuration
+ /// * `epistemic_edges` - Edges from this belief to other beliefs (for propagation)
+ /// * `downstream_nodes` - Mutable map of downstream belief nodes (for propagation writes)
++/// Compose the stable identity of ONE observation.
++///
++/// Three rules, all deliberate:
++/// * **without the provenance kind** — the same observation does not become a
++///   new one because it was re-classified (observed vs extracted vs told);
++/// * **without the timestamp** — a re-import, a consolidation or a corrected
++///   clock must not turn one observation into two;
++/// * **with a local key** — one source can carry several independent
++///   observations, so the caller names the one it means (sentence, claim id,
++///   span). Without a local key the whole source counts as one observation.
++///
++/// Callers that resolve a consolidated record back to its originals
++/// (`consolidation_members`) pass the ORIGINAL source rid, so a synthesis is
++/// not a second experience.
++pub fn observation_key(belief: NodeId, source_rid: &str, local: Option<&str>) -> String {
++    match local {
++        Some(l) => format!("b{belief:?}|{source_rid}|{l}"),
++        None => format!("b{belief:?}|{source_rid}"),
++    }
++}
++
+ pub fn assert_evidence(
+     node: &mut CognitiveNode,
+     evidence: &Evidence,
+@@ -194,11 +219,12 @@ pub fn assert_evidence(
+     let effective_weight = evidence.weight * reliability;
+ 
+     // Apply the Bayesian update
+-    belief.update(
++    belief.update_with_id(
+         evidence.weight,
+         reliability,
+         &evidence.source,
+         evidence.timestamp,
++        evidence.observation_id.as_deref(),
+     );
+ 
+     // Enforce confidence ceiling for volatile beliefs
+@@ -473,6 +499,7 @@ mod tests {
+             provenance: Provenance::Observed,
+             propagate: false,
+             timestamp: 1000.0,
++            observation_id: None,
+         }
+     }
+ 
+@@ -557,6 +584,7 @@ mod tests {
+             provenance: Provenance::Told, // highest reliability = 0.95
+             propagate: false,
+             timestamp: 1000.0,
++            observation_id: None,
+         };
+ 
+         let result = assert_evidence(&mut node, &evidence, &config).unwrap();
+@@ -576,6 +604,8 @@ mod tests {
+                 source: "test".to_string(),
+                 weight: 2.0,
+                 timestamp: 1000.0 - 3.0 * 86400.0,
++                observation_id: None,
++                history: Vec::new(),
+             });
+         }
+ 
+@@ -596,6 +626,8 @@ mod tests {
+                 source: "test".to_string(),
+                 weight: 2.0,
+                 timestamp: 1000.0 - 30.0 * 86400.0,
++                observation_id: None,
++                history: Vec::new(),
+             });
+         }
+ 
+@@ -625,6 +657,8 @@ mod tests {
+                         source: "old".to_string(),
+                         weight: 1.5,
+                         timestamp: 1000.0 - 60.0 * 86400.0, // 60 days ago
++                        observation_id: None,
++                        history: Vec::new(),
+                     });
+                 }
+                 n
+@@ -656,6 +690,7 @@ mod tests {
+             provenance: Provenance::Told,
+             propagate: false,
+             timestamp: 1000.0,
++            observation_id: None,
+         };
+ 
+         let ev_inferred = Evidence {
+@@ -665,6 +700,7 @@ mod tests {
+             provenance: Provenance::Inferred,
+             propagate: false,
+             timestamp: 1000.0,
++            observation_id: None,
+         };
+ 
+         let r_told = assert_evidence(&mut node_told, &ev_told, &config).unwrap();
+@@ -726,6 +762,7 @@ mod tests {
+             provenance: Provenance::Told,
+             propagate: false,
+             timestamp: 1000.0,
++            observation_id: None,
+         };
+ 
+         let result = assert_evidence(&mut node, &evidence, &config).unwrap();
+@@ -782,6 +819,7 @@ mod tests {
+             provenance: Provenance::Observed,
+             propagate: false,
+             timestamp: 1000.0,
++            observation_id: None,
+         };
+ 
+         assert!(assert_evidence(&mut node, &evidence, &config).is_none());
+diff --git a/crates/yantrikdb-core/src/cognition/belief_query.rs b/crates/yantrikdb-core/src/cognition/belief_query.rs
+index 829cf35..1a4c663 100644
+--- a/crates/yantrikdb-core/src/cognition/belief_query.rs
++++ b/crates/yantrikdb-core/src/cognition/belief_query.rs
+@@ -480,16 +480,22 @@ mod tests {
+                 source: "morning observation".to_string(),
+                 weight: 1.5,
+                 timestamp: 500.0,
++                observation_id: None,
++                history: Vec::new(),
+             });
+             b.evidence_trail.push(EvidenceEntry {
+                 source: "afternoon crash".to_string(),
+                 weight: -0.3,
+                 timestamp: 700.0,
++                observation_id: None,
++                history: Vec::new(),
+             });
+             b.evidence_trail.push(EvidenceEntry {
+                 source: "productivity data".to_string(),
+                 weight: 0.8,
+                 timestamp: 900.0,
++                observation_id: None,
++                history: Vec::new(),
+             });
+         }
+ 
+@@ -529,21 +535,29 @@ mod tests {
+                 source: "old".into(),
+                 weight: -0.5,
+                 timestamp: 100.0,
++                observation_id: None,
++                history: Vec::new(),
+             },
+             EvidenceEntry {
+                 source: "old2".into(),
+                 weight: -0.3,
+                 timestamp: 200.0,
++                observation_id: None,
++                history: Vec::new(),
+             },
+             EvidenceEntry {
+                 source: "new".into(),
+                 weight: 1.0,
+                 timestamp: 800.0,
++                observation_id: None,
++                history: Vec::new(),
+             },
+             EvidenceEntry {
+                 source: "new2".into(),
+                 weight: 0.8,
+                 timestamp: 900.0,
++                observation_id: None,
++                history: Vec::new(),
+             },
+         ];
+ 
+diff --git a/crates/yantrikdb-core/src/cognition/benchmark.rs b/crates/yantrikdb-core/src/cognition/benchmark.rs
+index 0f99549..04674a5 100644
+--- a/crates/yantrikdb-core/src/cognition/benchmark.rs
++++ b/crates/yantrikdb-core/src/cognition/benchmark.rs
+@@ -399,11 +399,15 @@ pub fn build_aisha() -> Result<PersonaScenario> {
+                     source: "successful operations".into(),
+                     weight: 1.5,
+                     timestamp: 1000.0,
++                    observation_id: None,
++                    history: Vec::new(),
+                 },
+                 EvidenceEntry {
+                     source: "attending feedback".into(),
+                     weight: 1.0,
+                     timestamp: 2000.0,
++                    observation_id: None,
++                    history: Vec::new(),
+                 },
+             ],
+             user_confirmed: true,
+@@ -423,11 +427,15 @@ pub fn build_aisha() -> Result<PersonaScenario> {
+                     source: "encouraging messages".into(),
+                     weight: 1.5,
+                     timestamp: 1000.0,
++                    observation_id: None,
++                    history: Vec::new(),
+                 },
+                 EvidenceEntry {
+                     source: "complained about missed dinner".into(),
+                     weight: -0.5,
+                     timestamp: 3000.0,
++                    observation_id: None,
++                    history: Vec::new(),
+                 },
+             ],
+             user_confirmed: false,
+@@ -836,6 +844,8 @@ pub fn build_priya() -> Result<PersonaScenario> {
+                 source: "conference talk".into(),
+                 weight: 0.5,
+                 timestamp: 1000.0,
++                observation_id: None,
++                history: Vec::new(),
+             }],
+             user_confirmed: false,
+         }),
+@@ -854,11 +864,15 @@ pub fn build_priya() -> Result<PersonaScenario> {
+                     source: "benchmark results".into(),
+                     weight: 1.5,
+                     timestamp: 1000.0,
++                    observation_id: None,
++                    history: Vec::new(),
+                 },
+                 EvidenceEntry {
+                     source: "team productivity".into(),
+                     weight: 0.5,
+                     timestamp: 2000.0,
++                    observation_id: None,
++                    history: Vec::new(),
+                 },
+             ],
+             user_confirmed: true,
+@@ -2243,6 +2257,7 @@ fn run_belief_engine_tests(run: &mut BenchRun, scenario: &PersonaScenario) {
+             provenance: Provenance::Observed,
+             propagate: false,
+             timestamp: now_secs(),
++            observation_id: None,
+         };
+         if assert_evidence(node, &evidence, &config).is_some() {
+             assertion_count += 1;
+diff --git a/crates/yantrikdb-core/src/cognition/contradiction.rs b/crates/yantrikdb-core/src/cognition/contradiction.rs
+index 1d45136..2f61da3 100644
+--- a/crates/yantrikdb-core/src/cognition/contradiction.rs
++++ b/crates/yantrikdb-core/src/cognition/contradiction.rs
+@@ -594,6 +594,8 @@ mod tests {
+                     source: format!("source_{i}"),
+                     weight: 0.5,
+                     timestamp: 1000.0 + i as f64,
++                    observation_id: None,
++                    history: Vec::new(),
+                 });
+             }
+         }
+diff --git a/crates/yantrikdb-core/src/cognition/state.rs b/crates/yantrikdb-core/src/cognition/state.rs
+index a45f756..ab7938b 100644
+--- a/crates/yantrikdb-core/src/cognition/state.rs
++++ b/crates/yantrikdb-core/src/cognition/state.rs
+@@ -605,12 +605,48 @@ impl BeliefPayload {
+     /// `weight` is the log-likelihood ratio: positive supports, negative contradicts.
+     /// `reliability` scales the update (0.0 = ignore, 1.0 = full weight).
+     pub fn update(&mut self, weight: f64, reliability: f64, source: &str, timestamp: f64) {
++        self.update_with_id(weight, reliability, source, timestamp, None);
++    }
++
++    /// [`update`] with a caller-supplied observation identity.
++    ///
++    /// * Same id already in the trail → REPLACE its weight and correct
++    ///   `log_odds` by the delta. The observation is re-evaluated, not
++    ///   re-counted; the original timestamp stays (an observation does not
++    ///   become a different one because it was re-assessed later).
++    /// * Unknown or absent id → append, exactly as before.
++    ///
++    /// Measured before this existed: asserting the same evidence twice doubled
++    /// the log-odds (0.90 → 1.80) and no repeat could be recognised.
++    pub fn update_with_id(
++        &mut self,
++        weight: f64,
++        reliability: f64,
++        source: &str,
++        timestamp: f64,
++        observation_id: Option<&str>,
++    ) {
+         let effective_weight = weight * reliability;
++        if let Some(oid) = observation_id {
++            if let Some(entry) = self
++                .evidence_trail
++                .iter_mut()
++                .find(|e| e.observation_id.as_deref() == Some(oid))
++            {
++                entry.history.push((entry.weight, entry.timestamp));
++                self.log_odds += effective_weight - entry.weight;
++                entry.weight = effective_weight;
++                entry.source = source.to_string();
++                return;
++            }
++        }
+         self.log_odds += effective_weight;
+         self.evidence_trail.push(EvidenceEntry {
+             source: source.to_string(),
+             weight: effective_weight,
+             timestamp,
++            observation_id: observation_id.map(|s| s.to_string()),
++            history: Vec::new(),
+         });
+     }
+ 
+@@ -642,6 +678,19 @@ pub struct EvidenceEntry {
+     pub weight: f64,
+     /// When this evidence was recorded.
+     pub timestamp: f64,
++    /// Stable identity of the OBSERVATION this entry came from, when the caller
++    /// can name one (belief + original source + provenance kind). Two assertions
++    /// with the same id are the same observation: the second one revises the
++    /// first instead of adding a second vote. Re-imports, consolidations and
++    /// corrected timestamps do not change the id — the timestamp is not part of
++    /// it on purpose.
++    #[serde(default)]
++    pub observation_id: Option<String>,
++    /// Earlier assessments of the SAME observation: (weight, timestamp), oldest
++    /// first. A re-evaluation replaces `weight` and moves the previous value
++    /// here, so the current state and its development stay distinguishable.
++    #[serde(default)]
++    pub history: Vec<(f64, f64)>,
+ }
+ 
+ /// Goal: a desired future state.
+@@ -2024,6 +2073,8 @@ mod tests {
+                 source: "observation".to_string(),
+                 weight: 2.0,
+                 timestamp: 1000.0,
++                observation_id: None,
++                history: Vec::new(),
+             }],
+             user_confirmed: true,
+         });
+diff --git a/crates/yantrikdb-core/src/engine/belief.rs b/crates/yantrikdb-core/src/engine/belief.rs
+index 2e366f8..e675357 100644
+--- a/crates/yantrikdb-core/src/engine/belief.rs
++++ b/crates/yantrikdb-core/src/engine/belief.rs
+@@ -341,6 +341,7 @@ mod tests {
+             provenance: Provenance::Observed,
+             propagate: false,
+             timestamp: 1000.0,
++            observation_id: None,
+         };
+ 
+         let config = BeliefRevisionConfig::default();
+@@ -383,6 +384,7 @@ mod tests {
+             provenance: Provenance::Extracted,
+             propagate: true,
+             timestamp: 1000.0,
++            observation_id: None,
+         };
+ 
+         let config = BeliefRevisionConfig::default();
+@@ -423,6 +425,7 @@ mod tests {
+                 provenance: Provenance::Observed,
+                 propagate: false,
+                 timestamp: 1000.0,
++                observation_id: None,
+             },
+             Evidence {
+                 target_belief: n2.id,
+@@ -431,6 +434,7 @@ mod tests {
+                 provenance: Provenance::Inferred,
+                 propagate: false,
+                 timestamp: 1000.0,
++                observation_id: None,
+             },
+         ];
+ 
+@@ -500,6 +504,7 @@ mod tests {
+             provenance: Provenance::Observed,
+             propagate: false,
+             timestamp: 1000.0,
++            observation_id: None,
+         };
+ 
+         let config = BeliefRevisionConfig::default();
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs b/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
+new file mode 100644
+index 0000000..6317798
+--- /dev/null
++++ b/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
+@@ -0,0 +1,108 @@
++use super::*;
++use crate::belief::{propagate_evidence, revise_beliefs, BeliefRevisionConfig};
++use crate::state::{BeliefPayload, CognitiveEdge, CognitiveEdgeKind, EvidenceEntry};
++use crate::{CognitiveNode, NodeId, NodeKind, NodePayload};
++use std::collections::HashMap;
++
++fn belief(seq: u32, trail: Vec<EvidenceEntry>, log_odds: f64) -> CognitiveNode {
++    let id = NodeId::new(NodeKind::Belief, seq);
++    CognitiveNode::new(
++        id,
++        format!("b{seq}"),
++        NodePayload::Belief(BeliefPayload {
++            proposition: "Probe.".into(),
++            log_odds,
++            domain: "general".into(),
++            evidence_trail: trail,
++            user_confirmed: false,
++        }),
++    )
++}
++
++fn lo(n: &CognitiveNode) -> f64 {
++    match &n.payload { NodePayload::Belief(b) => b.log_odds, _ => panic!() }
++}
++
++/// Ein zweiter Lauf zur SELBEN Zeit darf nicht erneut denselben Zeitraum verfallen lassen.
++///
++/// BEKANNTER DEFEKT (25.11.2026): gemessen 0,1000 → 0,0050. `apply_staleness_decay`
++/// rechnet „Tage seit der letzten Evidenz" bei JEDEM Aufruf neu und schiebt den
++/// Evidenz-Zeitstempel nicht fort — deshalb fällt derselbe Zeitraum mehrfach an.
++#[ignore = "known defect: second revision at the same instant decays again (0.1000 -> 0.0050)"]
++#[test]
++fn repeated_revision_at_same_time_is_idempotent() {
++    let cfg = BeliefRevisionConfig::default();
++    let now = 1_800_000_000.0_f64;
++    let trail = vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: now - 60.0 * 86400.0, observation_id: None, history: Vec::new() }];
++    let mut a = belief(21, trail.clone(), 2.0);
++    let mut b = belief(22, trail, 2.0);
++
++    revise_beliefs(&mut [&mut a], now, &cfg);
++    let once = lo(&a);
++    // derselbe Zeitpunkt, zweiter Aufruf
++    revise_beliefs(&mut [&mut a], now, &cfg);
++    let twice = lo(&a);
++
++    revise_beliefs(&mut [&mut b], now, &cfg);
++    println!("SELBE ZEIT: einmal={once:.4} zweimal={twice:.4} (Referenz {:.4})", lo(&b));
++    assert!((twice - once).abs() < 1e-9,
++            "second revision at the same instant decayed again: {once} -> {twice}");
++}
++
++/// Der Verfall muss von der verstrichenen Zeit abhängen, nicht von der Zahl der Aufrufe.
++///
++/// BEKANNTER DEFEKT (25.11.2026): 1 Aufruf nach 30 Tagen = 0,1000, 30 Aufrufe = 0,0000.
++/// Ein Wartungslauf, der je Turn `revise_beliefs` ruft, löscht jede Überzeugung.
++#[ignore = "known defect: decay scales with call count (30 calls -> 0.0000 vs 1 call -> 0.1000)"]
++#[test]
++fn decay_follows_elapsed_time_not_call_count() {
++    let cfg = BeliefRevisionConfig::default();
++    let t0 = 1_800_000_000.0_f64;
++    let mk = |seq| belief(seq, vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: t0 - 60.0 * 86400.0, observation_id: None, history: Vec::new() }], 2.0);
++
++    // A: ein Aufruf, 30 Tage nach t0
++    let mut a = mk(23);
++    revise_beliefs(&mut [&mut a], t0 + 30.0 * 86400.0, &cfg);
++    let one_call = lo(&a);
++
++    // B: dreißig Aufrufe, je einen Tag später
++    let mut b = mk(24);
++    for d in 1..=30 {
++        revise_beliefs(&mut [&mut b], t0 + d as f64 * 86400.0, &cfg);
++    }
++    let thirty_calls = lo(&b);
++
++    println!("AUFRUFABHÄNGIGKEIT: 1 Aufruf nach 30 d = {one_call:.4} · 30 Aufrufe = {thirty_calls:.4}");
++    assert!((one_call - thirty_calls).abs() < 1e-6,
++            "decay depends on how often revise_beliefs runs: {one_call} vs {thirty_calls}");
++}
++
++fn edge(src: NodeId, dst: NodeId) -> CognitiveEdge {
++    CognitiveEdge {
++        src, dst, kind: CognitiveEdgeKind::Supports, weight: 1.0,
++        created_at_ms: 1_800_000_000_000, last_confirmed_ms: 1_800_000_000_000,
++        observation_count: 1, confidence: 1.0,
++    }
++}
++
++/// Dieselbe Kante zweimal propagiert: zählt sie doppelt?
++#[test]
++fn repeated_propagation_of_one_edge() {
++    let cfg = BeliefRevisionConfig::default();
++    let a = belief(25, vec![], 0.0);
++    let b = belief(26, vec![], 0.0);
++    let (ai, bi) = (a.id, b.id);
++
++    let mut once: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    once.insert(bi, b.clone());
++    let _ = propagate_evidence(ai, 1.0, &[edge(ai, bi)], &mut once, &cfg, 0);
++
++    let mut twice: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    twice.insert(bi, b);
++    let _ = propagate_evidence(ai, 1.0, &[edge(ai, bi)], &mut twice, &cfg, 0);
++    let _ = propagate_evidence(ai, 1.0, &[edge(ai, bi)], &mut twice, &cfg, 0);
++
++    let o = lo(&once[&bi]); let t = lo(&twice[&bi]);
++    println!("PROPAGATION: einmal={o:.4} zweimal={t:.4} doppelt={}", (t - 2.0 * o).abs() < 1e-9);
++    assert!(t >= o);
++}
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_lifecycle.rs b/crates/yantrikdb-core/src/engine/tests/belief_lifecycle.rs
+new file mode 100644
+index 0000000..c94572b
+--- /dev/null
++++ b/crates/yantrikdb-core/src/engine/tests/belief_lifecycle.rs
+@@ -0,0 +1,171 @@
++use super::*;
++use crate::belief::{assert_evidence, BeliefRevisionConfig, Evidence};
++use crate::state::{BeliefPayload, Provenance};
++use crate::{CognitiveNode, NodeId, NodeKind, NodePayload};
++
++fn sigmoid(l: f64) -> f64 { 1.0 / (1.0 + (-l).exp()) }
++
++fn belief_node(seq: u32, proposition: &str) -> CognitiveNode {
++    let id = NodeId::new(NodeKind::Belief, seq);
++    CognitiveNode::new(
++        id,
++        format!("belief-{seq}"),
++        NodePayload::Belief(BeliefPayload {
++            proposition: proposition.to_string(),
++            log_odds: 0.0,
++            domain: "general".to_string(),
++            evidence_trail: Vec::new(),
++            user_confirmed: false,
++        }),
++    )
++}
++
++fn log_odds_of(node: &CognitiveNode) -> f64 {
++    match &node.payload {
++        NodePayload::Belief(b) => b.log_odds,
++        _ => panic!("not a belief"),
++    }
++}
++
++fn evidence(id: NodeId, weight: f64, source: &str) -> Evidence {
++    Evidence {
++        target_belief: id,
++        weight,
++        source: source.to_string(),
++        provenance: Provenance::Observed,
++        propagate: false,
++        timestamp: 1_800_000_000.0,
++        observation_id: None,
++    }
++}
++
++/// Der Knoten überlebt den Neustart: persistieren, neu laden, gleicher Zustand.
++#[test]
++fn belief_node_persists_and_reloads() {
++    let dir = std::env::temp_dir().join(format!("ydb-belief-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++    let path = dir.join("store.db");
++
++    let id = {
++        let db = YantrikDB::new(path.to_str().unwrap(), 8).unwrap();
++        let mut node = belief_node(1, "A2A-Koordination folgt einem abgestimmten Verfahren.");
++        let cfg = BeliefRevisionConfig::default();
++        let nid = id_of(&node);
++        let _ = assert_evidence(&mut node, &evidence(nid, 1.4, "quelle-a"), &cfg);
++        db.persist_cognitive_node(&node).unwrap();
++        log_odds_of(&node)
++    };
++
++    let db = YantrikDB::new(path.to_str().unwrap(), 8).unwrap();
++    let loaded = db.load_cognitive_node(NodeId::new(NodeKind::Belief, 1)).unwrap().expect("node");
++    assert!((log_odds_of(&loaded) - id).abs() < 1e-9, "log_odds must survive the restart");
++    match &loaded.payload {
++        NodePayload::Belief(b) => assert!(!b.evidence_trail.is_empty()),
++        _ => panic!("payload kind changed across reload"),
++    }
++    assert_eq!(db.count_cognitive_nodes(Some(NodeKind::Belief)).unwrap(), 1);
++    assert!(db.explain_belief(NodeId::new(NodeKind::Belief, 1)).unwrap().is_some());
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++fn id_of(node: &CognitiveNode) -> NodeId {
++    node.id
++}
++
++/// Bestätigung hebt, Widerspruch senkt — auf der Belief-Ebene, nicht beim Pattern.
++#[test]
++fn evidence_raises_and_lowers_log_odds() {
++    let mut node = belief_node(2, "Testaussage.");
++    let cfg = BeliefRevisionConfig::default();
++    let id = id_of(&node);
++
++    let _ = assert_evidence(&mut node, &evidence(id, 1.4, "stuetzt"), &cfg);
++    let after_support = log_odds_of(&node);
++    assert!(after_support > 0.0, "supporting evidence must raise log_odds");
++
++    let _ = assert_evidence(&mut node, &evidence(id, -1.3, "widerspricht"), &cfg);
++    let after_contra = log_odds_of(&node);
++    assert!(after_contra < after_support, "contradicting evidence must lower log_odds");
++}
++
++/// Zwei stützende Belege ergeben eine andere Aussage als zwanzig — die Zahl der
++/// unabhängigen Stützungen ist die Evidenz, nicht die Zahl der Cluster-Mitglieder.
++#[test]
++fn support_scales_with_independent_evidence_not_with_cluster_size() {
++    let cfg = BeliefRevisionConfig::default();
++    let mut few = belief_node(3, "Zwei unabhaengige Belege.");
++    let mut many = belief_node(4, "Zwanzig Cluster-Mitglieder.");
++    let (fid, mid) = (id_of(&few), id_of(&many));
++    for i in 0..2 {
++        let _ = assert_evidence(&mut few, &evidence(fid, 0.35, &format!("beleg-{i}")), &cfg);
++    }
++    for i in 0..20 {
++        let _ = assert_evidence(&mut many, &evidence(mid, 0.35, &format!("mitglied-{i}")), &cfg);
++    }
++    let p_few = sigmoid(log_odds_of(&few));
++    let p_many = sigmoid(log_odds_of(&many));
++    assert!(p_few < 0.70, "two independent supports must stay moderate, got {p_few}");
++    assert!(p_many > 0.95, "twenty supports reach near-certainty, got {p_many}");
++    // Dieselbe widersprechende Beobachtung trifft die beiden sehr verschieden.
++    let _ = assert_evidence(&mut few, &evidence(fid, -1.5, "zustand geaendert"), &cfg);
++    let _ = assert_evidence(&mut many, &evidence(mid, -1.5, "zustand geaendert"), &cfg);
++    assert!(sigmoid(log_odds_of(&few)) < 0.5, "correctly counted belief is refuted");
++    assert!(sigmoid(log_odds_of(&many)) > 0.9, "over-counted belief shrugs it off");
++}
++
++/// Dieselbe Beobachtung zweimal: mit stabiler Identität ist sie idempotent,
++/// ohne Identität zählt sie doppelt (Ist-Zustand, festgehalten).
++#[test]
++fn same_observation_is_idempotent_with_an_identity() {
++    let cfg = BeliefRevisionConfig::default();
++
++    // (a) mit observation_id: zweimal dieselbe Beobachtung ändert nichts
++    let mut node = belief_node(5, "Idempotenz mit Identitaet.");
++    let id = id_of(&node);
++    let mut ev = evidence(id, 1.0, "dieselbe quelle, derselbe zeitpunkt");
++    ev.observation_id = Some("belief:5|src:rid-a|observed".into());
++    let _ = assert_evidence(&mut node, &ev, &cfg);
++    let once = log_odds_of(&node);
++    let _ = assert_evidence(&mut node, &ev, &cfg);
++    let twice = log_odds_of(&node);
++    let trail = match &node.payload { NodePayload::Belief(b) => b.evidence_trail.len(), _ => 0 };
++    println!("MIT ID: einmal={once:.4} zweimal={twice:.4} trail={trail}");
++    assert!((twice - once).abs() < 1e-12, "same observation counted twice: {once} -> {twice}");
++    assert_eq!(trail, 1, "the trail must hold one entry per observation");
++
++    // (b) Neubewertung derselben Beobachtung: Wirkung wird ersetzt, nicht addiert
++    let mut ev2 = evidence(id, -0.6, "neu bewertet");
++    ev2.observation_id = Some("belief:5|src:rid-a|observed".into());
++    let _ = assert_evidence(&mut node, &ev2, &cfg);
++    let revised = log_odds_of(&node);
++    // Invariante: log_odds ist die Summe der Trail-Gewichte. Eine Neubewertung
++    // ersetzt ein Gewicht, sie addiert keines.
++    let (sum, trail_weights) = match &node.payload {
++        NodePayload::Belief(b) => (
++            b.evidence_trail.iter().map(|e| e.weight).sum::<f64>(),
++            b.evidence_trail.iter().map(|e| e.weight).collect::<Vec<_>>(),
++        ),
++        _ => (0.0, vec![]),
++    };
++    println!("NEUBEWERTUNG: {once:.4} -> {revised:.4} · Trail-Gewichte {trail_weights:?} · Summe {sum:.4}");
++    assert!((revised - sum).abs() < 1e-12, "log_odds must equal the sum of the trail");
++    assert_eq!(trail_weights.len(), 1);
++    let trail2 = match &node.payload { NodePayload::Belief(b) => b.evidence_trail.len(), _ => 0 };
++    assert_eq!(trail2, 1, "re-evaluation must not add a second observation");
++}
++
++/// Ohne Identität bleibt das alte Verhalten: jede Äußerung zählt.
++#[test]
++fn without_an_identity_every_assertion_counts() {
++    let cfg = BeliefRevisionConfig::default();
++    let mut node = belief_node(6, "Ohne Identitaet.");
++    let id = id_of(&node);
++    let ev = evidence(id, 1.0, "keine identitaet");
++    let _ = assert_evidence(&mut node, &ev, &cfg);
++    let once = log_odds_of(&node);
++    let _ = assert_evidence(&mut node, &ev, &cfg);
++    let twice = log_odds_of(&node);
++    println!("OHNE ID: einmal={once:.4} zweimal={twice:.4}");
++    assert!((twice - 2.0 * once).abs() < 1e-12);
++}
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs b/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
+new file mode 100644
+index 0000000..93b2932
+--- /dev/null
++++ b/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
+@@ -0,0 +1,120 @@
++use super::*;
++use crate::belief::{propagate_evidence, revise_beliefs, BeliefRevisionConfig};
++use crate::state::{BeliefPayload, CognitiveEdge, CognitiveEdgeKind, EvidenceEntry};
++use crate::{CognitiveNode, NodeId, NodeKind, NodePayload};
++use std::collections::HashMap;
++
++fn belief(seq: u32, prop: &str, trail: Vec<EvidenceEntry>) -> CognitiveNode {
++    let id = NodeId::new(NodeKind::Belief, seq);
++    CognitiveNode::new(
++        id,
++        format!("belief-{seq}"),
++        NodePayload::Belief(BeliefPayload {
++            proposition: prop.to_string(),
++            log_odds: 0.0,
++            domain: "general".to_string(),
++            evidence_trail: trail,
++            user_confirmed: false,
++        }),
++    )
++}
++
++fn lo(n: &CognitiveNode) -> f64 {
++    match &n.payload {
++        NodePayload::Belief(b) => b.log_odds,
++        _ => panic!("not a belief"),
++    }
++}
++
++fn edge(src: NodeId, dst: NodeId, kind: CognitiveEdgeKind, weight: f64) -> CognitiveEdge {
++    CognitiveEdge {
++        src,
++        dst,
++        kind,
++        weight,
++        created_at_ms: 1_800_000_000_000,
++        last_confirmed_ms: 1_800_000_000_000,
++        observation_count: 1,
++        confidence: 1.0,
++    }
++}
++
++/// Eine Supports-Kante trägt Evidenz auf den Zielknoten.
++#[test]
++fn supports_edge_raises_target() {
++    let a = belief(11, "Quelle.", vec![]);
++    let b = belief(12, "Ziel.", vec![]);
++    let e = edge(a.id, b.id, CognitiveEdgeKind::Supports, 1.0);
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(b.id, b);
++
++    let effects = propagate_evidence(a.id, 1.0, &[e], &mut down, &BeliefRevisionConfig::default(), 0);
++    assert!(!effects.is_empty(), "supports edge must produce an effect");
++    assert!(lo(&down[&NodeId::new(NodeKind::Belief, 12)]) > 0.0);
++}
++
++/// Eine Contradicts-Kante senkt den Zielknoten.
++#[test]
++fn contradicts_edge_lowers_target() {
++    let a = belief(13, "Quelle.", vec![]);
++    let b = belief(14, "Ziel.", vec![]);
++    let e = edge(a.id, b.id, CognitiveEdgeKind::Contradicts, 1.0);
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(b.id, b);
++
++    let effects = propagate_evidence(a.id, 1.0, &[e], &mut down, &BeliefRevisionConfig::default(), 0);
++    assert!(!effects.is_empty());
++    assert!(lo(&down[&NodeId::new(NodeKind::Belief, 14)]) < 0.0);
++}
++
++/// Ein Zyklus (A stützt B, B stützt A) darf die Konfidenz nicht aufschaukeln:
++/// nach mehreren Hops bleibt der Betrag unter dem Deckel der Konfiguration.
++#[test]
++fn support_cycle_stays_bounded() {
++    let cfg = BeliefRevisionConfig::default();
++    let a = belief(15, "A.", vec![]);
++    let b = belief(16, "B.", vec![]);
++    let (ai, bi) = (a.id, b.id);
++    let edges = vec![
++        edge(ai, bi, CognitiveEdgeKind::Supports, 1.0),
++        edge(bi, ai, CognitiveEdgeKind::Supports, 1.0),
++    ];
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(ai, a);
++    down.insert(bi, b);
++
++    for hop in 0..6u32 {
++        let src = if hop % 2 == 0 { ai } else { bi };
++        let _ = propagate_evidence(src, 1.0, &edges, &mut down, &cfg, hop);
++    }
++    let max_seen = lo(&down[&ai]).abs().max(lo(&down[&bi]).abs());
++    println!("ZYKLUS max_abs_log_odds nach 6 Hops = {max_seen:.4} (Deckel {:.1})", cfg.max_abs_log_odds);
++    assert!(
++        max_seen <= cfg.max_abs_log_odds + 1e-9,
++        "cycle amplification exceeded the configured ceiling: {max_seen}"
++    );
++}
++
++/// Veraltung: ein Belief ohne neue Evidenz über die Karenzzeit hinaus verliert Konfidenz,
++/// und `revise_beliefs` meldet die Revision.
++#[test]
++fn revise_beliefs_decays_stale_evidence() {
++    let cfg = BeliefRevisionConfig::default();
++    let now = 1_800_000_000.0_f64;
++    let old = now - 60.0 * 86400.0; // 60 Tage alt, Karenz ist 7
++    let mut b = belief(
++        17,
++        "Nur alte Belege.",
++        vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: old, observation_id: None, history: Vec::new() }],
++    );
++    if let NodePayload::Belief(p) = &mut b.payload {
++        p.log_odds = 2.0;
++    }
++    let before = lo(&b);
++    let summary = revise_beliefs(&mut [&mut b], now, &cfg);
++    let after = lo(&b);
++    println!("REVISION vorher={before:.4} nachher={after:.4} decays={} revised={}",
++             summary.staleness_decays, summary.beliefs_revised);
++    assert!(after < before, "stale belief must lose confidence");
++    assert!(summary.staleness_decays >= 1);
++}
+diff --git a/crates/yantrikdb-core/src/engine/tests/evidence_identity_semantics.rs b/crates/yantrikdb-core/src/engine/tests/evidence_identity_semantics.rs
+new file mode 100644
+index 0000000..19870cf
+--- /dev/null
++++ b/crates/yantrikdb-core/src/engine/tests/evidence_identity_semantics.rs
+@@ -0,0 +1,137 @@
++use super::*;
++use crate::belief::{assert_evidence, observation_key, BeliefRevisionConfig, Evidence};
++use crate::state::{BeliefPayload, Provenance};
++use crate::{CognitiveNode, NodeId, NodeKind, NodePayload};
++
++fn belief(seq: u32, prior: f64) -> CognitiveNode {
++    let id = NodeId::new(NodeKind::Belief, seq);
++    CognitiveNode::new(
++        id,
++        format!("b{seq}"),
++        NodePayload::Belief(BeliefPayload {
++            proposition: "Probe.".into(),
++            log_odds: prior,
++            domain: "general".into(),
++            evidence_trail: Vec::new(),
++            user_confirmed: false,
++        }),
++    )
++}
++
++fn lo(n: &CognitiveNode) -> f64 {
++    match &n.payload { NodePayload::Belief(b) => b.log_odds, _ => panic!() }
++}
++
++fn trail(n: &CognitiveNode) -> Vec<crate::state::EvidenceEntry> {
++    match &n.payload { NodePayload::Belief(b) => b.evidence_trail.clone(), _ => panic!() }
++}
++
++fn ev(id: NodeId, weight: f64, provenance: Provenance, oid: Option<String>) -> Evidence {
++    Evidence {
++        target_belief: id,
++        weight,
++        source: "quelle".into(),
++        provenance,
++        propagate: false,
++        timestamp: 1_800_000_000.0,
++        observation_id: oid,
++    }
++}
++
++/// Regel 1a: EINE Quelle kann mehrere unabhängige Beobachtungen tragen.
++#[test]
++fn one_source_can_carry_several_observations() {
++    let cfg = BeliefRevisionConfig::default();
++    let mut node = belief(31, 0.0);
++    let id = node.id;
++    for local in ["satz-1", "satz-2"] {
++        let e = ev(id, 0.5, Provenance::Observed, Some(observation_key(id, "rid-a", Some(local))));
++        let _ = assert_evidence(&mut node, &e, &cfg);
++    }
++    println!("EINE QUELLE, ZWEI BEOBACHTUNGEN: trail={} log_odds={:.4}", trail(&node).len(), lo(&node));
++    assert_eq!(trail(&node).len(), 2, "two local observations must both count");
++}
++
++/// Regel 1b: dieselbe Beobachtung erhält durch eine andere Provenienzart KEINE neue Identität.
++#[test]
++fn provenance_kind_does_not_change_the_identity() {
++    let cfg = BeliefRevisionConfig::default();
++    let mut node = belief(32, 0.0);
++    let id = node.id;
++    let key = observation_key(id, "rid-a", Some("satz-1"));
++    let _ = assert_evidence(&mut node, &ev(id, 0.5, Provenance::Observed, Some(key.clone())), &cfg);
++    let _ = assert_evidence(&mut node, &ev(id, 0.5, Provenance::Extracted, Some(key)), &cfg);
++    println!("PROVENIENZART: trail={} log_odds={:.4}", trail(&node).len(), lo(&node));
++    assert_eq!(trail(&node).len(), 1, "re-classifying must not create a second observation");
++    // Die Identität bleibt, der WERT darf sich ändern: eine andere Provenienzart
++    // skaliert die Zuverlässigkeit (Observed 0,9 · Extracted 0,75), die
++    // Neubewertung ersetzt also das Gewicht, statt zu addieren.
++    let sum: f64 = trail(&node).iter().map(|e| e.weight).sum();
++    assert!((lo(&node) - sum).abs() < 1e-12);
++    assert!(lo(&node) < 0.5, "a weaker provenance must lower the weight, not add");
++}
++
++/// Regel 2: die vorherige Bewertung bleibt rekonstruierbar.
++#[test]
++fn re_evaluation_keeps_the_previous_assessment() {
++    let cfg = BeliefRevisionConfig::default();
++    let mut node = belief(33, 0.0);
++    let id = node.id;
++    let key = observation_key(id, "rid-a", None);
++    let _ = assert_evidence(&mut node, &ev(id, 1.0, Provenance::Observed, Some(key.clone())), &cfg);
++    let first = trail(&node)[0].weight;
++    let _ = assert_evidence(&mut node, &ev(id, -0.4, Provenance::Observed, Some(key)), &cfg);
++    let t = trail(&node);
++    println!("NEUBEWERTUNG MIT HISTORIE: aktuell {:.4} · Historie {:?}", t[0].weight, t[0].history);
++    assert_eq!(t.len(), 1, "one observation, not two");
++    assert_eq!(t[0].history.len(), 1, "the previous assessment must be kept");
++    assert!((t[0].history[0].0 - first).abs() < 1e-12, "history must hold the old weight");
++    assert!((t[0].weight + 0.4 * 0.9).abs() < 1e-9 || t[0].weight < 0.0);
++}
++
++/// Regel 3: die Invariante gilt OHNE Prior, Deckel und Verfall.
++#[test]
++fn invariant_holds_without_prior_ceiling_or_decay() {
++    let cfg = BeliefRevisionConfig::default();
++    let mut node = belief(34, 0.0);
++    let id = node.id;
++    for (i, w) in [0.4, -0.2, 0.7].iter().enumerate() {
++        let e = ev(id, *w, Provenance::Observed, Some(observation_key(id, "rid-a", Some(&i.to_string()))));
++        let _ = assert_evidence(&mut node, &e, &cfg);
++    }
++    let sum: f64 = trail(&node).iter().map(|e| e.weight).sum();
++    println!("INVARIANTE ohne Störgrößen: log_odds={:.4} Summe={:.4}", lo(&node), sum);
++    assert!((lo(&node) - sum).abs() < 1e-12);
++}
++
++/// Regel 3 (Gegenprobe): mit PRIOR gilt `log_odds == prior + Summe`.
++#[test]
++fn invariant_becomes_prior_plus_sum_with_a_prior() {
++    let cfg = BeliefRevisionConfig::default();
++    let mut node = belief(35, 0.8);
++    let id = node.id;
++    for i in 0..2 {
++        let e = ev(id, 0.3, Provenance::Observed, Some(observation_key(id, "rid-a", Some(&i.to_string()))));
++        let _ = assert_evidence(&mut node, &e, &cfg);
++    }
++    let sum: f64 = trail(&node).iter().map(|e| e.weight).sum();
++    println!("INVARIANTE mit Prior: log_odds={:.4} prior+Summe={:.4}", lo(&node), 0.8 + sum);
++    assert!((lo(&node) - (0.8 + sum)).abs() < 1e-12);
++}
++
++/// Regel 3 (Gegenprobe): der Konfidenzdeckel bricht die Summeninvariante — bewusst.
++#[test]
++fn confidence_ceiling_breaks_the_sum_invariant() {
++    let cfg = BeliefRevisionConfig::default();
++    let mut node = belief(36, 0.0);
++    let id = node.id;
++    // deutlich über max_abs_log_odds (Default 6.0) aufsummieren
++    for i in 0..20 {
++        let e = ev(id, 1.0, Provenance::Observed, Some(observation_key(id, "rid-a", Some(&i.to_string()))));
++        let _ = assert_evidence(&mut node, &e, &cfg);
++    }
++    let sum: f64 = trail(&node).iter().map(|e| e.weight).sum();
++    println!("DECKEL: log_odds={:.4} Summe={:.4} Deckel={:.1}", lo(&node), sum, cfg.max_abs_log_odds);
++    assert!((lo(&node).abs() - cfg.max_abs_log_odds).abs() < 1e-9, "ceiling must clamp");
++    assert!((lo(&node) - sum).abs() > 1e-6, "and the sum invariant must visibly break");
++}
+diff --git a/crates/yantrikdb-core/src/engine/tests/mod.rs b/crates/yantrikdb-core/src/engine/tests/mod.rs
+index 62ff3bd..98b3443 100644
+--- a/crates/yantrikdb-core/src/engine/tests/mod.rs
++++ b/crates/yantrikdb-core/src/engine/tests/mod.rs
+@@ -51,6 +51,10 @@ mod moves;
+ mod null_embedding;
+ mod recall_confidence;
+ mod recall_graph;
++mod belief_lifecycle;
++mod belief_propagation;
++mod belief_decay_semantics;
++mod evidence_identity_semantics;
+ mod reembed_router;
+ #[cfg(feature = "bundled-embedder")]
+ mod reextract_claims;
+-- 
+2.47.3
+

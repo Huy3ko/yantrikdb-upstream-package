@@ -1,0 +1,62 @@
+--- .hermes/plugins/yantrikdb/client.py	2026-11-22 14:11:22.970836194 +0100
++++ /tmp/plugin-personality-cand/client.py	2026-11-25 15:36:50.315996978 +0100
+@@ -174,6 +174,12 @@
+     # ACHTUNG: ein Plugin-Update ueberschreibt diesen Block. Der Waechter
+     # dazu steht in ~/.hermes/scripts/yantrikdb-pause-watch.py.
+     consolidation_enabled: bool = False
++    # Ableitung der engine-eigenen Telemetrietraits (warmth/depth/energy/
++    # attentiveness) beim think()-Lauf. Vorgabe AUS: die Werte sind
++    # Telemetrie, keine Persona, und werden nicht in den Prompt injiziert
++    # (Entscheidung 18.11.2026). Wiedereinschalten bewusst:
++    # YANTRIKDB_PERSONALITY_DERIVE=true
++    personality_derive: bool = False
+     # constitution (v0.14.0): the operator's standing rules.
+     #
+     # Until now exactly one channel in this plugin carried always-injected
+@@ -583,6 +589,9 @@
+             consolidation_enabled=_parse_bool(
+                 _profile_env("YANTRIKDB_CONSOLIDATION_ENABLED"), default=False,
+             ),
++            personality_derive=_parse_bool(
++                _profile_env("YANTRIKDB_PERSONALITY_DERIVE"), default=False,
++            ),
+             constitution_path=_profile_env("YANTRIKDB_CONSTITUTION_PATH", ""),
+             constitution_max_chars=_parse_int(
+                 _profile_env("YANTRIKDB_CONSTITUTION_MAX_CHARS"), 1500,
+@@ -1116,13 +1125,15 @@
+         run_consolidation: bool = True,
+         run_conflict_scan: bool = True,
+         run_pattern_mining: bool = False,
+-        run_personality: bool = False,
++        run_personality: bool | None = None,
+         consolidation_limit: int | None = None,
+     ) -> dict[str, Any]:
+         # No `namespace` in the body — the server's /v1/think parser never
+         # read it, so sending it only ever looked like scoping. Kept in
+         # lockstep with the embedded backend so the two cannot drift; see
+         # the note on EmbeddedYantrikDBClient.think and issue #87.
++        if run_personality is None:
++            run_personality = bool(getattr(self.config, "personality_derive", False))
+         body: dict[str, Any] = {
+             "run_consolidation": run_consolidation,
+             "run_conflict_scan": run_conflict_scan,
+--- .hermes/plugins/yantrikdb/embedded.py	2026-11-21 16:53:08.742858088 +0100
++++ /tmp/plugin-personality-cand/embedded.py	2026-11-25 15:36:50.315996978 +0100
+@@ -767,7 +767,7 @@
+         run_consolidation: bool = True,
+         run_conflict_scan: bool = True,
+         run_pattern_mining: bool = False,
+-        run_personality: bool = False,
++        run_personality: bool | None = None,
+         consolidation_limit: int | None = None,
+     ) -> dict[str, Any]:
+         # NO `namespace` KEY HERE, and no namespace parameter — see issue #87.
+@@ -784,6 +784,8 @@
+         # namespace before clustering, and the conflict scans join on equal
+         # namespaces. A multi-agent store consolidates each namespace on its
+         # own during one store-wide pass.
++        if run_personality is None:
++            run_personality = bool(getattr(self.config, "personality_derive", False))
+         cfg: dict[str, Any] = {
+             "run_consolidation": run_consolidation,
+             "run_conflict_scan": run_conflict_scan,

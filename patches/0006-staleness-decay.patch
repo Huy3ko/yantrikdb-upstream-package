@@ -1,0 +1,726 @@
+From b05361dfcb432eb9344566cc69d9cd9d73d06c7e Mon Sep 17 00:00:00 2001
+From: Huy3ko <hugundlach@gmail.com>
+Date: Wed, 25 Nov 2026 19:28:10 +0100
+Subject: [PATCH] fix(belief): staleness decay depends on elapsed time, not on
+ call count
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The two ignored regression tests in engine/tests/belief_decay_semantics.rs
+carried the measurement: a second revision at the SAME instant decayed again
+(0.1000 -> 0.0050), and 30 revisions one day apart destroyed a belief that one
+revision after 30 days left at 0.1000. `apply_staleness_decay` multiplied the
+running value by a factor recomputed from the same evidence timestamp on every
+call, so a maintenance loop that runs once per turn erased every conviction.
+
+The value is now recomputed from the base the evidence supports
+(`BeliefPayload.undecayed_log_odds`, `#[serde(default)]` for existing rows),
+never from what the previous pass wrote:
+
+* idempotent — two passes at the same instant produce the same value;
+* call-count independent — only elapsed time since the newest evidence counts,
+  whatever the loop granularity;
+* persistence-weighted — `attrs.persistence` resists TIME decay
+  (rate * (1 - persistence); 1.0 never decays) but does not shield against
+  contradicting evidence, which is assertion, not revision.
+
+The base moves with every change to log-odds (`shift_log_odds` / `set_log_odds`:
+evidence, propagated contribution, confirm, refute), so a re-assertion cannot
+promote an already-decayed value to "undecayed" and charge the same elapsed
+time twice. Found in the two-process acceptance run, pinned by a unit test that
+fails against the naive variant (1.4184 -> 1.1177).
+
+Tests: both ignored tests re-enabled and green (1.5760 -> 1.5760;
+1.3360 == 1.3360), plus persistence weighting against the documented formula,
+persistence 1.0 vs. contradiction, the re-assertion case, and a DB round-trip
+proving that both attrs.persistence and the payload anchor survive persist/load.
+---
+ .../examples/belief_from_pattern.rs           |   1 +
+ .../examples/belief_lifecycle.rs              |   1 +
+ crates/yantrikdb-core/src/cognition/action.rs |   1 +
+ .../yantrikdb-core/src/cognition/analogy.rs   |   1 +
+ .../yantrikdb-core/src/cognition/attention.rs |   1 +
+ crates/yantrikdb-core/src/cognition/belief.rs |  29 ++-
+ .../src/cognition/belief_query.rs             |   1 +
+ .../yantrikdb-core/src/cognition/benchmark.rs |   8 +
+ .../yantrikdb-core/src/cognition/coherence.rs |   1 +
+ .../src/cognition/contradiction.rs            |   1 +
+ crates/yantrikdb-core/src/cognition/state.rs  |  41 +++-
+ crates/yantrikdb-core/src/engine/belief.rs    |   5 +-
+ .../yantrikdb-core/src/engine/graph_state.rs  |   1 +
+ .../engine/tests/belief_decay_semantics.rs    | 180 ++++++++++++++++--
+ .../src/engine/tests/belief_lifecycle.rs      |   1 +
+ .../src/engine/tests/belief_propagation.rs    |   3 +-
+ .../tests/belief_propagation_identity.rs      |   1 +
+ .../tests/evidence_identity_semantics.rs      |   1 +
+ 18 files changed, 258 insertions(+), 20 deletions(-)
+
+diff --git a/crates/yantrikdb-core/examples/belief_from_pattern.rs b/crates/yantrikdb-core/examples/belief_from_pattern.rs
+index ca019dc..6e68678 100644
+--- a/crates/yantrikdb-core/examples/belief_from_pattern.rs
++++ b/crates/yantrikdb-core/examples/belief_from_pattern.rs
+@@ -42,6 +42,7 @@ fn main() {
+             domain: "general".to_string(),
+             evidence_trail: Vec::new(),
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         }),
+     );
+     db.persist_cognitive_node(&node).expect("persist");
+diff --git a/crates/yantrikdb-core/examples/belief_lifecycle.rs b/crates/yantrikdb-core/examples/belief_lifecycle.rs
+index c93cb09..d5bc3d3 100644
+--- a/crates/yantrikdb-core/examples/belief_lifecycle.rs
++++ b/crates/yantrikdb-core/examples/belief_lifecycle.rs
+@@ -59,6 +59,7 @@ fn main() {
+                     domain: "general".to_string(),
+                     evidence_trail: Vec::new(),
+                     user_confirmed: false,
++                    undecayed_log_odds: None,
+                 }),
+             );
+             db.persist_cognitive_node(&node).expect("persist creation");
+diff --git a/crates/yantrikdb-core/src/cognition/action.rs b/crates/yantrikdb-core/src/cognition/action.rs
+index c2ac188..e45d4c4 100644
+--- a/crates/yantrikdb-core/src/cognition/action.rs
++++ b/crates/yantrikdb-core/src/cognition/action.rs
+@@ -1051,6 +1051,7 @@ mod tests {
+                 domain: "test".to_string(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+         );
+ 
+diff --git a/crates/yantrikdb-core/src/cognition/analogy.rs b/crates/yantrikdb-core/src/cognition/analogy.rs
+index 1a9fab8..c83d525 100644
+--- a/crates/yantrikdb-core/src/cognition/analogy.rs
++++ b/crates/yantrikdb-core/src/cognition/analogy.rs
+@@ -1029,6 +1029,7 @@ mod tests {
+                 domain: domain.to_string(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+         )
+     }
+diff --git a/crates/yantrikdb-core/src/cognition/attention.rs b/crates/yantrikdb-core/src/cognition/attention.rs
+index 26cc36b..dede90d 100644
+--- a/crates/yantrikdb-core/src/cognition/attention.rs
++++ b/crates/yantrikdb-core/src/cognition/attention.rs
+@@ -908,6 +908,7 @@ mod tests {
+                 domain: "test".into(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+             NodeKind::Goal => NodePayload::Goal(GoalPayload {
+                 description: label.into(),
+diff --git a/crates/yantrikdb-core/src/cognition/belief.rs b/crates/yantrikdb-core/src/cognition/belief.rs
+index 6586b0b..c8d8d0c 100644
+--- a/crates/yantrikdb-core/src/cognition/belief.rs
++++ b/crates/yantrikdb-core/src/cognition/belief.rs
+@@ -396,12 +396,23 @@ pub fn propagate_evidence_from(
+ /// regress toward uncertainty (log_odds → 0). This prevents ancient
+ /// beliefs from dominating when they may no longer be valid.
+ ///
++/// The value is recomputed from the undecayed base, never from the value
++/// the previous pass wrote:
++/// * **time-based** — the amount depends on how much time has passed since the
++///   newest evidence, not on how often the revision loop ran;
++/// * **idempotent** — a second pass at the same instant is a no-op;
++/// * **persistence-weighted** — a node's `attrs.persistence` resists TIME
++///   decay (1.0 = never decays). It does not shield against contradicting
++///   evidence: that is assertion, not revision.
++///
+ /// Returns the amount of log-odds decayed (positive = moved toward 0).
+ pub fn apply_staleness_decay(
+     node: &mut CognitiveNode,
+     now_secs: f64,
+     config: &BeliefRevisionConfig,
+ ) -> f64 {
++    let persistence = node.attrs.persistence.clamp(0.0, 1.0);
++
+     let belief = match &mut node.payload {
+         NodePayload::Belief(b) => b,
+         _ => return 0.0,
+@@ -425,10 +436,22 @@ pub fn apply_staleness_decay(
+     }
+ 
+     let effective_days = days_since_evidence - config.staleness_grace_period_days;
+-    let decay_factor = 1.0 - (config.staleness_rate_per_day * effective_days).min(0.95);
++    // Persistence is resistance to time: 1.0 never decays, 0.0 decays at the
++    // full configured rate.
++    let rate = config.staleness_rate_per_day * (1.0 - persistence);
++    if rate <= 0.0 {
++        return 0.0;
++    }
++    let decay_factor = 1.0 - (rate * effective_days).min(0.95);
+ 
++    // The base is what the evidence (and the prior) support; the stored value
++    // may already be a decayed one. Keeping the base makes the result a
++    // function of (evidence, elapsed time, persistence) only.
++    let base = belief.undecayed_log_odds.unwrap_or(belief.log_odds);
+     let old_log_odds = belief.log_odds;
+-    belief.log_odds *= decay_factor;
++    belief.undecayed_log_odds = Some(base);
++    belief.log_odds = (base * decay_factor)
++        .clamp(-config.max_abs_log_odds, config.max_abs_log_odds);
+ 
+     // Enforce ceiling after decay too
+     enforce_confidence_ceiling(belief, &node.attrs, config);
+@@ -533,6 +556,7 @@ mod tests {
+                 domain: "test".to_string(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+         );
+         node.attrs.confidence = sigmoid(log_odds);
+@@ -887,6 +911,7 @@ mod tests {
+                 domain: "test".to_string(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+         );
+         node.attrs.confidence = sigmoid(log_odds);
+diff --git a/crates/yantrikdb-core/src/cognition/belief_query.rs b/crates/yantrikdb-core/src/cognition/belief_query.rs
+index f29b323..e71f33c 100644
+--- a/crates/yantrikdb-core/src/cognition/belief_query.rs
++++ b/crates/yantrikdb-core/src/cognition/belief_query.rs
+@@ -405,6 +405,7 @@ mod tests {
+                 domain: domain.to_string(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+         );
+         node.attrs.confidence = sigmoid(log_odds);
+diff --git a/crates/yantrikdb-core/src/cognition/benchmark.rs b/crates/yantrikdb-core/src/cognition/benchmark.rs
+index 196cc82..33411b6 100644
+--- a/crates/yantrikdb-core/src/cognition/benchmark.rs
++++ b/crates/yantrikdb-core/src/cognition/benchmark.rs
+@@ -413,6 +413,7 @@ pub fn build_aisha() -> Result<PersonaScenario> {
+                 },
+             ],
+             user_confirmed: true,
++            undecayed_log_odds: None,
+         }),
+     ));
+ 
+@@ -443,6 +444,7 @@ pub fn build_aisha() -> Result<PersonaScenario> {
+                 },
+             ],
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         }),
+     ));
+ 
+@@ -853,6 +855,7 @@ pub fn build_priya() -> Result<PersonaScenario> {
+                 paths: Vec::new(),
+             }],
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         }),
+     ));
+ 
+@@ -883,6 +886,7 @@ pub fn build_priya() -> Result<PersonaScenario> {
+                 },
+             ],
+             user_confirmed: true,
++            undecayed_log_odds: None,
+         }),
+     ));
+ 
+@@ -1588,6 +1592,7 @@ fn run_belief_revision_tests(run: &mut BenchRun) {
+         domain: "test".into(),
+         evidence_trail: vec![],
+         user_confirmed: false,
++        undecayed_log_odds: None,
+     };
+ 
+     for i in 0..20 {
+@@ -1617,6 +1622,7 @@ fn run_belief_revision_tests(run: &mut BenchRun) {
+         domain: "test".into(),
+         evidence_trail: vec![],
+         user_confirmed: false,
++        undecayed_log_odds: None,
+     };
+     for i in 0..10 {
+         let weight = if i % 2 == 0 { 0.5 } else { -0.5 };
+@@ -1642,6 +1648,7 @@ fn run_belief_revision_tests(run: &mut BenchRun) {
+         domain: "test".into(),
+         evidence_trail: vec![],
+         user_confirmed: false,
++        undecayed_log_odds: None,
+     };
+     let mut low_rel = BeliefPayload {
+         proposition: "B".into(),
+@@ -1649,6 +1656,7 @@ fn run_belief_revision_tests(run: &mut BenchRun) {
+         domain: "test".into(),
+         evidence_trail: vec![],
+         user_confirmed: false,
++        undecayed_log_odds: None,
+     };
+     high_rel.update(1.0, 0.95, "reliable", 100.0);
+     low_rel.update(1.0, 0.3, "unreliable", 100.0);
+diff --git a/crates/yantrikdb-core/src/cognition/coherence.rs b/crates/yantrikdb-core/src/cognition/coherence.rs
+index 50d08f5..7a0ff98 100644
+--- a/crates/yantrikdb-core/src/cognition/coherence.rs
++++ b/crates/yantrikdb-core/src/cognition/coherence.rs
+@@ -994,6 +994,7 @@ mod tests {
+                 domain: "test".to_string(),
+                 evidence_trail: Vec::new(),
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+             label: label.to_string(),
+             metadata: Default::default(),
+diff --git a/crates/yantrikdb-core/src/cognition/contradiction.rs b/crates/yantrikdb-core/src/cognition/contradiction.rs
+index 769328c..d189965 100644
+--- a/crates/yantrikdb-core/src/cognition/contradiction.rs
++++ b/crates/yantrikdb-core/src/cognition/contradiction.rs
+@@ -429,6 +429,7 @@ mod tests {
+                 domain: domain.to_string(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+         );
+         node.attrs.confidence = crate::state::sigmoid(log_odds);
+diff --git a/crates/yantrikdb-core/src/cognition/state.rs b/crates/yantrikdb-core/src/cognition/state.rs
+index a15b440..df02120 100644
+--- a/crates/yantrikdb-core/src/cognition/state.rs
++++ b/crates/yantrikdb-core/src/cognition/state.rs
+@@ -593,9 +593,36 @@ pub struct BeliefPayload {
+     pub evidence_trail: Vec<EvidenceEntry>,
+     /// Whether this belief has been directly confirmed by the user.
+     pub user_confirmed: bool,
++    /// Log-odds as supported by the evidence trail and the prior — i.e. the
++    /// value BEFORE any staleness decay was written into `log_odds`.
++    ///
++    /// Maintained wherever `log_odds` moves (`shift_log_odds`/`set_log_odds`),
++    /// so a decay pass recomputes the stored value from this base instead of
++    /// multiplying the running value again: a second revision at the same
++    /// instant is a no-op, and the result depends on elapsed time only, never
++    /// on how often `revise_beliefs` ran. `None` only on rows written before
++    /// this field existed.
++    #[serde(default)]
++    pub undecayed_log_odds: Option<f64>,
+ }
+ 
+ impl BeliefPayload {
++    /// Move `log_odds` by `delta` and keep the undecayed base in step.
++    ///
++    /// The base is what the evidence supports; it moves by the same amount, so
++    /// a later decay pass never mistakes an already-decayed value for an
++    /// undecayed one — which would charge the same elapsed time twice.
++    pub fn shift_log_odds(&mut self, delta: f64) {
++        let base = self.undecayed_log_odds.unwrap_or(self.log_odds);
++        self.log_odds += delta;
++        self.undecayed_log_odds = Some(base + delta);
++    }
++
++    /// Set `log_odds` outright (a direct statement) and reset the base to it.
++    pub fn set_log_odds(&mut self, value: f64) {
++        self.log_odds = value;
++        self.undecayed_log_odds = Some(value);
++    }
+     /// Convert log-odds to probability.
+     pub fn probability(&self) -> f64 {
+         sigmoid(self.log_odds)
+@@ -634,13 +661,14 @@ impl BeliefPayload {
+                 .find(|e| e.observation_id.as_deref() == Some(oid))
+             {
+                 entry.history.push((entry.weight, entry.timestamp));
+-                self.log_odds += effective_weight - entry.weight;
++                let delta = effective_weight - entry.weight;
+                 entry.weight = effective_weight;
+                 entry.source = source.to_string();
++                self.shift_log_odds(delta);
+                 return;
+             }
+         }
+-        self.log_odds += effective_weight;
++        self.shift_log_odds(effective_weight);
+         self.evidence_trail.push(EvidenceEntry {
+             source: source.to_string(),
+             weight: effective_weight,
+@@ -702,7 +730,7 @@ impl BeliefPayload {
+             if weight == 0.0 {
+                 return;
+             }
+-            self.log_odds += weight;
++            self.shift_log_odds(weight);
+             self.evidence_trail.push(EvidenceEntry {
+                 source: source.to_string(),
+                 weight,
+@@ -733,9 +761,10 @@ impl BeliefPayload {
+             return;
+         }
+         entry.history.push((entry.weight, entry.timestamp));
+-        self.log_odds += aggregate - entry.weight;
++        let delta = aggregate - entry.weight;
+         entry.weight = aggregate;
+         entry.source = source.to_string();
++        self.shift_log_odds(delta);
+     }
+ 
+     /// How much evidence supports this belief (sum of positive weights).
+@@ -1831,6 +1860,7 @@ mod tests {
+             domain: "preferences".to_string(),
+             evidence_trail: vec![],
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         };
+ 
+         assert!((belief.probability() - 0.5).abs() < 1e-10);
+@@ -2016,6 +2046,7 @@ mod tests {
+                 domain: "preferences".to_string(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+         );
+ 
+@@ -2157,6 +2188,7 @@ mod tests {
+                 domain: "test".into(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+             NodePayload::Goal(GoalPayload {
+                 description: "test".into(),
+@@ -2190,6 +2222,7 @@ mod tests {
+                 paths: Vec::new(),
+             }],
+             user_confirmed: true,
++            undecayed_log_odds: None,
+         });
+ 
+         let json = serialize_payload(&original);
+diff --git a/crates/yantrikdb-core/src/engine/belief.rs b/crates/yantrikdb-core/src/engine/belief.rs
+index a5f6cb7..205e7e9 100644
+--- a/crates/yantrikdb-core/src/engine/belief.rs
++++ b/crates/yantrikdb-core/src/engine/belief.rs
+@@ -266,7 +266,7 @@ impl YantrikDB {
+             node.attrs.provenance = crate::state::Provenance::Told;
+             // Boost confidence for confirmed beliefs
+             let boost = 1.0; // +1.0 log-odds ≈ +0.27 probability at P=0.5
+-            belief.log_odds += boost;
++            belief.shift_log_odds(boost);
+             node.attrs.confidence = crate::state::sigmoid(belief.log_odds);
+             self.persist_cognitive_node(&node)?;
+             Ok(true)
+@@ -287,7 +287,7 @@ impl YantrikDB {
+ 
+         if let NodePayload::Belief(ref mut belief) = node.payload {
+             belief.user_confirmed = true; // Confirmed as FALSE
+-            belief.log_odds = -4.0; // Strong disbelief
++            belief.set_log_odds(-4.0); // Strong disbelief
+             node.attrs.confidence = crate::state::sigmoid(belief.log_odds);
+             node.attrs.provenance = crate::state::Provenance::Told;
+             self.persist_cognitive_node(&node)?;
+@@ -323,6 +323,7 @@ mod tests {
+                 domain: "test".to_string(),
+                 evidence_trail: vec![],
+                 user_confirmed: false,
++                undecayed_log_odds: None,
+             }),
+         );
+         node.attrs.confidence = crate::state::sigmoid(log_odds);
+diff --git a/crates/yantrikdb-core/src/engine/graph_state.rs b/crates/yantrikdb-core/src/engine/graph_state.rs
+index ad503f7..cca9847 100644
+--- a/crates/yantrikdb-core/src/engine/graph_state.rs
++++ b/crates/yantrikdb-core/src/engine/graph_state.rs
+@@ -1163,6 +1163,7 @@ mod tests {
+             domain: "test".into(),
+             evidence_trail: vec![],
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         })
+     }
+ 
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs b/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
+index 19b5700..2938e56 100644
+--- a/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
++++ b/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
+@@ -1,6 +1,6 @@
+ use super::*;
+-use crate::belief::{propagate_evidence, revise_beliefs, BeliefRevisionConfig};
+-use crate::state::{BeliefPayload, CognitiveEdge, CognitiveEdgeKind, EvidenceEntry};
++use crate::belief::{assert_evidence, propagate_evidence, revise_beliefs, BeliefRevisionConfig, Evidence};
++use crate::state::{BeliefPayload, CognitiveEdge, CognitiveEdgeKind, EvidenceEntry, Provenance};
+ use crate::{CognitiveNode, NodeId, NodeKind, NodePayload};
+ use std::collections::HashMap;
+ 
+@@ -15,6 +15,7 @@ fn belief(seq: u32, trail: Vec<EvidenceEntry>, log_odds: f64) -> CognitiveNode {
+             domain: "general".into(),
+             evidence_trail: trail,
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         }),
+     )
+ }
+@@ -25,15 +26,15 @@ fn lo(n: &CognitiveNode) -> f64 {
+ 
+ /// Ein zweiter Lauf zur SELBEN Zeit darf nicht erneut denselben Zeitraum verfallen lassen.
+ ///
+-/// BEKANNTER DEFEKT (25.11.2026): gemessen 0,1000 → 0,0050. `apply_staleness_decay`
+-/// rechnet „Tage seit der letzten Evidenz" bei JEDEM Aufruf neu und schiebt den
+-/// Evidenz-Zeitstempel nicht fort — deshalb fällt derselbe Zeitraum mehrfach an.
+-#[ignore = "known defect: second revision at the same instant decays again (0.1000 -> 0.0050)"]
++/// BEKANNTER DEFEKT (25.11.2026, vor dem Fix): gemessen 0,1000 → 0,0050.
++/// `apply_staleness_decay` rechnete „Tage seit der letzten Evidenz" bei JEDEM
++/// Aufruf neu und wandte den Faktor auf den bereits verfallenen Wert an.
++/// Der Fix rechnet vom unverfallenen Grundwert (`undecayed_log_odds`).
+ #[test]
+ fn repeated_revision_at_same_time_is_idempotent() {
+     let cfg = BeliefRevisionConfig::default();
+     let now = 1_800_000_000.0_f64;
+-    let trail = vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: now - 60.0 * 86400.0, observation_id: None, history: Vec::new(), paths: Vec::new(),}];
++    let trail = vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: now - 60.0 * 86400.0, observation_id: None, history: Vec::new(), paths: Vec::new() }];
+     let mut a = belief(21, trail.clone(), 2.0);
+     let mut b = belief(22, trail, 2.0);
+ 
+@@ -51,14 +52,15 @@ fn repeated_revision_at_same_time_is_idempotent() {
+ 
+ /// Der Verfall muss von der verstrichenen Zeit abhängen, nicht von der Zahl der Aufrufe.
+ ///
+-/// BEKANNTER DEFEKT (25.11.2026): 1 Aufruf nach 30 Tagen = 0,1000, 30 Aufrufe = 0,0000.
+-/// Ein Wartungslauf, der je Turn `revise_beliefs` ruft, löscht jede Überzeugung.
+-#[ignore = "known defect: decay scales with call count (30 calls -> 0.0000 vs 1 call -> 0.1000)"]
++/// BEKANNTER DEFEKT (25.11.2026, vor dem Fix): 1 Aufruf nach 30 Tagen = 0,1000,
++/// 30 Aufrufe = 0,0000 — ein Wartungslauf, der je Turn `revise_beliefs` ruft,
++/// löschte jede Überzeugung. Der Fix macht das Ergebnis zu einer Funktion von
++/// (Evidenz, verstrichene Zeit, Persistenz) statt von der Aufrufzahl.
+ #[test]
+ fn decay_follows_elapsed_time_not_call_count() {
+     let cfg = BeliefRevisionConfig::default();
+     let t0 = 1_800_000_000.0_f64;
+-    let mk = |seq| belief(seq, vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: t0 - 60.0 * 86400.0, observation_id: None, history: Vec::new(), paths: Vec::new(),}], 2.0);
++    let mk = |seq| belief(seq, vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: t0 - 60.0 * 86400.0, observation_id: None, history: Vec::new(), paths: Vec::new() }], 2.0);
+ 
+     // A: ein Aufruf, 30 Tage nach t0
+     let mut a = mk(23);
+@@ -106,3 +108,159 @@ fn repeated_propagation_of_one_edge() {
+     println!("PROPAGATION: einmal={o:.4} zweimal={t:.4} doppelt={}", (t - 2.0 * o).abs() < 1e-9);
+     assert!(t >= o);
+ }
++
++fn old_trail(now: f64) -> Vec<EvidenceEntry> {
++    vec![EvidenceEntry {
++        source: "alt".into(),
++        weight: 2.0,
++        timestamp: now - 60.0 * 86400.0,
++        observation_id: None,
++        history: Vec::new(),
++        paths: Vec::new(),
++    }]
++}
++
++/// Der Verfall wiegt die Persistenz des Knotens: derselbe Beleg, dieselbe Zeit,
++/// aber `attrs.persistence` 0,2 gegen 0,9. Geprüft wird gegen die dokumentierte
++/// Formel, nicht gegen „kleiner als vorher".
++#[test]
++fn persistence_weights_the_time_decay() {
++    let cfg = BeliefRevisionConfig::default();
++    let now = 1_800_000_000.0_f64;
++
++    let mut low = belief(27, old_trail(now), 2.0);
++    low.attrs.persistence = 0.2;
++    let mut high = belief(28, old_trail(now), 2.0);
++    high.attrs.persistence = 0.9;
++
++    revise_beliefs(&mut [&mut low], now, &cfg);
++    revise_beliefs(&mut [&mut high], now, &cfg);
++
++    let days = 60.0 - cfg.staleness_grace_period_days;
++    let expect_low = 2.0 * (1.0 - (cfg.staleness_rate_per_day * (1.0 - 0.2) * days).min(0.95));
++    let expect_high = 2.0 * (1.0 - (cfg.staleness_rate_per_day * (1.0 - 0.9) * days).min(0.95));
++    println!(
++        "PERSISTENZ-GEWICHT: p=0,2 -> {:.4} (erwartet {expect_low:.4}) · p=0,9 -> {:.4} (erwartet {expect_high:.4})",
++        lo(&low), lo(&high)
++    );
++    assert!((lo(&low) - expect_low).abs() < 1e-9, "decay must use rate * (1 - persistence)");
++    assert!((lo(&high) - expect_high).abs() < 1e-9);
++    assert!(lo(&high) > lo(&low), "higher persistence must decay less");
++}
++
++/// Persistenz 1,0 schützt vor ZEITVERFALL — nicht vor Widerspruch.
++#[test]
++fn persistence_one_survives_time_but_not_contradiction() {
++    let cfg = BeliefRevisionConfig::default();
++    let now = 1_800_000_000.0_f64;
++    let mut node = belief(29, old_trail(now), 2.0);
++    node.attrs.persistence = 1.0;
++    let id = node.id;
++
++    revise_beliefs(&mut [&mut node], now + 3650.0 * 86400.0, &cfg);
++    assert!((lo(&node) - 2.0).abs() < 1e-12, "persistence 1.0 must not decay with time");
++
++    let counter = Evidence {
++        target_belief: id,
++        weight: -3.0,
++        source: "gegenprobe".into(),
++        provenance: Provenance::Observed,
++        propagate: false,
++        timestamp: now,
++        observation_id: None,
++    };
++    let r = assert_evidence(&mut node, &counter, &cfg).unwrap();
++    println!("PERSISTENZ 1,0: nach 10 Jahren {:.4} · nach Widerspruch {:.4}", 2.0, r.posterior_log_odds);
++    assert!(r.posterior_log_odds < 2.0 - 1.0, "contradicting evidence must still revise it");
++}
++
++/// Eine erneute Assertion derselben Beobachtung darf den bereits verfallenen
++/// Wert nicht als unverfallenen Grundwert übernehmen — sonst wird derselbe
++/// Zeitraum beim nächsten Lauf ein zweites Mal abgezogen. Gefunden im
++/// Zwei-Prozess-Abnahmelauf (examples/belief_acceptance.rs), nicht im Unit-Test.
++#[test]
++fn reassertion_after_decay_does_not_charge_the_same_time_twice() {
++    let cfg = BeliefRevisionConfig::default();
++    let now = 1_800_000_000.0_f64;
++    let oid = "b31|rid|1";
++    // Gewicht so, wie es eine Assertion mit 2,0 unter Observed (0,9) hinterlässt
++    let trail = vec![EvidenceEntry {
++        source: "alt".into(),
++        weight: 1.8,
++        timestamp: now - 60.0 * 86400.0,
++        observation_id: Some(oid.into()),
++        history: Vec::new(),
++        paths: Vec::new(),
++    }];
++    let mut node = belief(31, trail, 1.8);
++    let id = node.id;
++
++    revise_beliefs(&mut [&mut node], now, &cfg);
++    let decayed = lo(&node);
++
++    // dieselbe Beobachtung, gleiches effektives Gewicht: keine Neubewertung
++    let again = Evidence {
++        target_belief: id,
++        weight: 2.0,
++        source: "alt".into(),
++        provenance: Provenance::Observed,
++        propagate: false,
++        timestamp: now - 60.0 * 86400.0,
++        observation_id: Some(oid.into()),
++    };
++    let r = assert_evidence(&mut node, &again, &cfg).unwrap();
++    let after_assert = r.posterior_log_odds;
++
++    revise_beliefs(&mut [&mut node], now, &cfg);
++    let after_revision = lo(&node);
++
++    println!(
++        "ERNEUTE ASSERTION: verfällt {decayed:.4} · nach Assertion {after_assert:.4} · nach Revision {after_revision:.4}"
++    );
++    assert!((after_assert - decayed).abs() < 1e-12, "an unchanged re-assertion must not move the value");
++    assert!(
++        (after_revision - decayed).abs() < 1e-12,
++        "the elapsed time must not be charged twice after a re-assertion"
++    );
++}
++
++/// Die beiden Zustände, auf denen der Fix beruht, müssen PERSISTIERT sein:
++/// `attrs.persistence` (eigene Spalte) und `BeliefPayload.undecayed_log_odds`
++/// (JSON-Payload). Ein Fix, der nur im Speicher gilt, wäre nach einem Neustart
++/// wieder der alte Defekt.
++#[test]
++fn decay_state_survives_persistence() {
++    let cfg = BeliefRevisionConfig::default();
++    let now = 1_800_000_000.0_f64;
++    let db = YantrikDB::new(":memory:", 4).unwrap();
++
++    let mut node = belief(30, old_trail(now), 2.0);
++    node.attrs.persistence = 0.9;
++    db.persist_cognitive_node(&node).unwrap();
++
++    let mut loaded = db.load_cognitive_node(node.id).unwrap().unwrap();
++    println!("PERSISTENZ-SPALTE: gespeichert 0,9 · geladen {:.4}", loaded.attrs.persistence);
++    assert!((loaded.attrs.persistence - 0.9).abs() < 1e-12, "persistence must round-trip");
++
++    revise_beliefs(&mut [&mut loaded], now, &cfg);
++    let first = lo(&loaded);
++    db.persist_cognitive_node(&loaded).unwrap();
++
++    let mut reloaded = db.load_cognitive_node(node.id).unwrap().unwrap();
++    match &reloaded.payload {
++        NodePayload::Belief(b) => assert!(
++            b.undecayed_log_odds.is_some(),
++            "the decay anchor must survive the payload round-trip"
++        ),
++        _ => panic!("expected belief"),
++    }
++    revise_beliefs(&mut [&mut reloaded], now, &cfg);
++    println!(
++        "PERSISTENZ-RUNDLAUF: erster Lauf {first:.4} · nach Neuladen {:.4}",
++        lo(&reloaded)
++    );
++    assert!(
++        (lo(&reloaded) - first).abs() < 1e-12,
++        "a reloaded belief must not decay again for the same elapsed time"
++    );
++}
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_lifecycle.rs b/crates/yantrikdb-core/src/engine/tests/belief_lifecycle.rs
+index c94572b..3e4738d 100644
+--- a/crates/yantrikdb-core/src/engine/tests/belief_lifecycle.rs
++++ b/crates/yantrikdb-core/src/engine/tests/belief_lifecycle.rs
+@@ -16,6 +16,7 @@ fn belief_node(seq: u32, proposition: &str) -> CognitiveNode {
+             domain: "general".to_string(),
+             evidence_trail: Vec::new(),
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         }),
+     )
+ }
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs b/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
+index 5d4adc0..cf02c6d 100644
+--- a/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
++++ b/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
+@@ -15,6 +15,7 @@ fn belief(seq: u32, prop: &str, trail: Vec<EvidenceEntry>) -> CognitiveNode {
+             domain: "general".to_string(),
+             evidence_trail: trail,
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         }),
+     )
+ }
+@@ -105,7 +106,7 @@ fn revise_beliefs_decays_stale_evidence() {
+     let mut b = belief(
+         17,
+         "Nur alte Belege.",
+-        vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: old, observation_id: None, history: Vec::new(), paths: Vec::new(),}],
++        vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: old, observation_id: None, history: Vec::new(), paths: Vec::new() }],
+     );
+     if let NodePayload::Belief(p) = &mut b.payload {
+         p.log_odds = 2.0;
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_propagation_identity.rs b/crates/yantrikdb-core/src/engine/tests/belief_propagation_identity.rs
+index 2f9a9c3..1ff49c6 100644
+--- a/crates/yantrikdb-core/src/engine/tests/belief_propagation_identity.rs
++++ b/crates/yantrikdb-core/src/engine/tests/belief_propagation_identity.rs
+@@ -15,6 +15,7 @@ fn belief(seq: u32) -> CognitiveNode {
+             domain: "general".into(),
+             evidence_trail: Vec::new(),
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         }),
+     )
+ }
+diff --git a/crates/yantrikdb-core/src/engine/tests/evidence_identity_semantics.rs b/crates/yantrikdb-core/src/engine/tests/evidence_identity_semantics.rs
+index 19870cf..8911be6 100644
+--- a/crates/yantrikdb-core/src/engine/tests/evidence_identity_semantics.rs
++++ b/crates/yantrikdb-core/src/engine/tests/evidence_identity_semantics.rs
+@@ -14,6 +14,7 @@ fn belief(seq: u32, prior: f64) -> CognitiveNode {
+             domain: "general".into(),
+             evidence_trail: Vec::new(),
+             user_confirmed: false,
++            undecayed_log_odds: None,
+         }),
+     )
+ }
+-- 
+2.47.3
+

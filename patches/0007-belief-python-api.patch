@@ -1,0 +1,667 @@
+From d32f2195b39207b55cc2b64a6e415bacaf0c7870 Mon Sep 17 00:00:00 2001
+From: Huy3ko <hugundlach@gmail.com>
+Date: Wed, 25 Nov 2026 20:08:05 +0100
+Subject: [PATCH] feat(python): the native belief lifecycle is reachable from
+ Python
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The engine had the whole lifecycle — create, query, evidence with identity,
+re-assessment, propagation, explain, decay — and the Python bindings exposed
+none of it (measured: no attribute containing "belief" on YantrikDB).
+
+This is a mapping, not a second implementation: every semantic stays in
+yantrikdb_core. Two small native additions were needed and are deliberately
+minimal:
+
+* `create_belief` — node creation belongs where the persisted NodeIdAllocator
+  lives; a caller cannot allocate an id that survives a restart.
+* `revise_all_beliefs_at(now_secs, ..)` — the existing pass with the clock
+  supplied; `revise_all_beliefs` now delegates with `now()`. Without it a
+  time-based measurement is not deterministic (two runs a microsecond apart are
+  two instants).
+
+Bindings added (py_engine/belief_api.rs): belief_create, belief_get,
+belief_query, belief_inventory, belief_assert_evidence,
+belief_assert_evidence_batch, belief_explain, belief_relate, belief_edges,
+belief_confirm, belief_refute, belief_revise, belief_contradictions.
+`belief_get` returns the trail with each observation's earlier assessments
+(`history`) and the per-path contributions of propagated origins (`paths`).
+
+Acceptance: the Rust two-process lifecycle reproduced over Python (create,
+identity, propagation, re-assessment with history, explain, fixed-clock decay,
+restart, re-assert, query) — see ABNAHME-PYTHON-20261125.md.
+---
+ crates/yantrikdb-core/src/engine/belief.rs    |  57 +-
+ .../src/py_engine/belief_api.rs               | 527 ++++++++++++++++++
+ crates/yantrikdb-python/src/py_engine/mod.rs  |   1 +
+ 3 files changed, 583 insertions(+), 2 deletions(-)
+ create mode 100644 crates/yantrikdb-python/src/py_engine/belief_api.rs
+
+diff --git a/crates/yantrikdb-core/src/engine/belief.rs b/crates/yantrikdb-core/src/engine/belief.rs
+index 205e7e9..1550a17 100644
+--- a/crates/yantrikdb-core/src/engine/belief.rs
++++ b/crates/yantrikdb-core/src/engine/belief.rs
+@@ -13,7 +13,7 @@ use crate::belief::{
+ use crate::belief_query::{self, BeliefExplanation, BeliefInventory, BeliefPattern};
+ use crate::contradiction::{self, ContradictionConfig, ContradictionScanResult};
+ use crate::error::Result;
+-use crate::state::{CognitiveEdgeKind, CognitiveNode, NodeId, NodeKind, NodePayload};
++use crate::state::{BeliefPayload, CognitiveEdgeKind, CognitiveNode, NodeId, NodeKind, NodePayload};
+ 
+ use super::{now, YantrikDB};
+ 
+@@ -134,13 +134,66 @@ impl YantrikDB {
+         Ok(results)
+     }
+ 
++    // ── Creation ──
++
++    /// Create and persist a belief node.
++    ///
++    /// The node id comes from the persisted allocator the rest of the graph
++    /// uses, so creation is restart-safe and cannot collide with an existing
++    /// node. `prior_log_odds` is the value before any evidence; the trail
++    /// starts empty, and every later change goes through `assert_evidence`.
++    pub fn create_belief(
++        &self,
++        proposition: &str,
++        prior_log_odds: f64,
++        domain: &str,
++        label: Option<&str>,
++        persistence: Option<f64>,
++    ) -> Result<CognitiveNode> {
++        let mut alloc = self.load_node_id_allocator()?;
++        let id = alloc.alloc(NodeKind::Belief);
++        self.persist_node_id_allocator(&alloc)?;
++
++        let payload = BeliefPayload {
++            proposition: proposition.to_string(),
++            log_odds: prior_log_odds,
++            domain: domain.to_string(),
++            evidence_trail: Vec::new(),
++            user_confirmed: false,
++            undecayed_log_odds: None,
++        };
++        let mut node = CognitiveNode::new(
++            id,
++            label.unwrap_or(proposition).to_string(),
++            NodePayload::Belief(payload),
++        );
++        node.attrs.confidence = crate::state::sigmoid(prior_log_odds);
++        if let Some(p) = persistence {
++            node.attrs.persistence = p.clamp(0.0, 1.0);
++        }
++        self.persist_cognitive_node(&node)?;
++        Ok(node)
++    }
++
+     // ── Belief Revision (batch staleness + ceiling) ──
+ 
+     /// Run belief revision on all persistent beliefs: staleness decay + ceiling.
+     ///
+     /// This should be called during the `think()` loop to keep beliefs current.
+     pub fn revise_all_beliefs(&self, config: &BeliefRevisionConfig) -> Result<RevisionSummary> {
+-        let now_secs = now();
++        self.revise_all_beliefs_at(now(), config)
++    }
++
++    /// [`revise_all_beliefs`] with the clock supplied by the caller.
++    ///
++    /// Same revision, same persistence — only the instant is not the wall
++    /// clock. A caller that measures time-based behaviour cannot otherwise be
++    /// deterministic: two runs a microsecond apart are two different instants.
++    pub fn revise_all_beliefs_at(
++        &self,
++        now_secs: f64,
++        config: &BeliefRevisionConfig,
++    ) -> Result<RevisionSummary> {
+ 
+         // Load all belief nodes
+         let mut beliefs = self.load_cognitive_nodes_by_kind(NodeKind::Belief)?;
+diff --git a/crates/yantrikdb-python/src/py_engine/belief_api.rs b/crates/yantrikdb-python/src/py_engine/belief_api.rs
+new file mode 100644
+index 0000000..91bdce6
+--- /dev/null
++++ b/crates/yantrikdb-python/src/py_engine/belief_api.rs
+@@ -0,0 +1,527 @@
++//! Belief-Engine bindings.
++//!
++//! A **thin mapping** of the native lifecycle, not a second implementation:
++//! every semantic (identity, strongest-path aggregation, staleness decay,
++//! ceilings) lives in `yantrikdb_core`. These methods convert arguments into
++//! native types, call the engine, and turn the result into Python dicts.
++//!
++//! Lifecycle covered: create · get · query · inventory · assert evidence
++//! (single and batch) · re-assess · explain (provenance + history) · relate ·
++//! edges · confirm/refute · revise (decay) · contradictions.
++
++use pyo3::exceptions::PyValueError;
++use pyo3::prelude::*;
++use pyo3::types::{PyDict, PyList};
++type PyObject = pyo3::Py<pyo3::PyAny>;
++
++use yantrikdb_core::belief::{Evidence, EvidenceResult, RevisionSummary};
++use yantrikdb_core::belief_query::{BeliefExplanation, BeliefInventory, BeliefOrder, BeliefPattern};
++use yantrikdb_core::state::{
++    BeliefPayload, CognitiveAttrs, CognitiveEdge, CognitiveEdgeKind, CognitiveNode, EvidenceEntry,
++    NodeId, NodePayload, Provenance,
++};
++use yantrikdb_core::BeliefRevisionConfig;
++
++use super::PyYantrikDB;
++
++// ── argument helpers ──
++
++fn opt_f64(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<f64>> {
++    match d.get_item(key)? {
++        Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
++        _ => Ok(None),
++    }
++}
++
++fn opt_str(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
++    match d.get_item(key)? {
++        Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
++        _ => Ok(None),
++    }
++}
++
++fn opt_bool(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<bool>> {
++    match d.get_item(key)? {
++        Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
++        _ => Ok(None),
++    }
++}
++
++/// The native revision config. Same field names, same defaults — a dict that
++/// names nothing changes nothing.
++fn config_from(d: Option<&Bound<'_, PyDict>>) -> PyResult<BeliefRevisionConfig> {
++    let mut c = BeliefRevisionConfig::default();
++    let Some(d) = d else { return Ok(c) };
++    if let Some(v) = opt_f64(d, "staleness_rate_per_day")? {
++        c.staleness_rate_per_day = v;
++    }
++    if let Some(v) = opt_f64(d, "staleness_grace_period_days")? {
++        c.staleness_grace_period_days = v;
++    }
++    if let Some(v) = opt_f64(d, "max_abs_log_odds")? {
++        c.max_abs_log_odds = v;
++    }
++    if let Some(v) = opt_f64(d, "propagation_decay")? {
++        c.propagation_decay = v;
++    }
++    if let Some(v) = opt_f64(d, "min_propagation_weight")? {
++        c.min_propagation_weight = v;
++    }
++    if let Some(v) = opt_f64(d, "believed_threshold")? {
++        c.believed_threshold = v;
++    }
++    if let Some(v) = opt_f64(d, "disbelieved_threshold")? {
++        c.disbelieved_threshold = v;
++    }
++    if let Some(v) = opt_f64(d, "volatile_ceiling_log_odds")? {
++        c.volatile_ceiling_log_odds = v;
++    }
++    if let Some(v) = opt_f64(d, "volatility_threshold")? {
++        c.volatility_threshold = v;
++    }
++    if let Some(v) = d.get_item("max_propagation_hops")? {
++        if !v.is_none() {
++            c.max_propagation_hops = v.extract()?;
++        }
++    }
++    Ok(c)
++}
++
++fn edge_kind(s: &str) -> PyResult<CognitiveEdgeKind> {
++    CognitiveEdgeKind::from_str(s)
++        .ok_or_else(|| PyValueError::new_err(format!("unknown edge kind '{s}'")))
++}
++
++fn now_secs() -> f64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs_f64())
++        .unwrap_or(0.0)
++}
++
++// ── result helpers ──
++
++fn attrs_into(d: &Bound<'_, PyDict>, a: &CognitiveAttrs) -> PyResult<()> {
++    d.set_item("confidence", a.confidence)?;
++    d.set_item("activation", a.activation)?;
++    d.set_item("salience", a.salience)?;
++    d.set_item("persistence", a.persistence)?;
++    d.set_item("volatility", a.volatility)?;
++    d.set_item("evidence_count", a.evidence_count)?;
++    d.set_item("provenance", a.provenance.as_str())?;
++    d.set_item("last_updated_ms", a.last_updated_ms)?;
++    Ok(())
++}
++
++fn entry_into(py: Python<'_>, e: &EvidenceEntry) -> PyResult<PyObject> {
++    let d = PyDict::new(py);
++    d.set_item("source", e.source.clone())?;
++    d.set_item("weight", e.weight)?;
++    d.set_item("timestamp", e.timestamp)?;
++    d.set_item("observation_id", e.observation_id.clone())?;
++    // Earlier assessments of the SAME observation: (weight, timestamp).
++    d.set_item("history", e.history.clone())?;
++    // Per-path contributions of a propagated origin: (source node, weight).
++    let paths = PyList::empty(py);
++    for (via, w) in &e.paths {
++        paths.append((via.to_raw(), *w))?;
++    }
++    d.set_item("paths", paths)?;
++    Ok(d.into_any().unbind())
++}
++
++fn node_into(py: Python<'_>, node: &CognitiveNode) -> PyResult<PyObject> {
++    let d = PyDict::new(py);
++    d.set_item("id", node.id.to_raw())?;
++    d.set_item("kind", node.kind().as_str())?;
++    d.set_item("label", node.label.clone())?;
++    d.set_item("attrs", {
++        let a = PyDict::new(py);
++        attrs_into(&a, &node.attrs)?;
++        a
++    })?;
++    match &node.payload {
++        NodePayload::Belief(b) => {
++            d.set_item("proposition", b.proposition.clone())?;
++            d.set_item("log_odds", b.log_odds)?;
++            d.set_item("probability", b.probability())?;
++            d.set_item("domain", b.domain.clone())?;
++            d.set_item("user_confirmed", b.user_confirmed)?;
++            // The evidence-supported base: log_odds == base * decay.
++            d.set_item("undecayed_log_odds", b.undecayed_log_odds)?;
++            let trail = PyList::empty(py);
++            for e in &b.evidence_trail {
++                trail.append(entry_into(py, e)?)?;
++            }
++            d.set_item("evidence_trail", trail)?;
++        }
++        other => {
++            d.set_item("payload_kind", format!("{other:?}").split('(').next().unwrap_or("?"))?;
++        }
++    }
++    Ok(d.into_any().unbind())
++}
++
++fn evidence_result_into(py: Python<'_>, r: &EvidenceResult) -> PyResult<PyObject> {
++    let d = PyDict::new(py);
++    d.set_item("belief_id", r.belief_id.to_raw())?;
++    d.set_item("prior_log_odds", r.prior_log_odds)?;
++    d.set_item("posterior_log_odds", r.posterior_log_odds)?;
++    d.set_item("prior_probability", r.prior_probability)?;
++    d.set_item("posterior_probability", r.posterior_probability)?;
++    d.set_item("effective_weight", r.effective_weight)?;
++    d.set_item("crossed_threshold", r.crossed_threshold)?;
++    d.set_item("threshold_direction", r.threshold_direction.map(|t| format!("{t:?}")))?;
++    let props = PyList::empty(py);
++    for p in &r.propagated_to {
++        let e = PyDict::new(py);
++        e.set_item("belief_id", p.belief_id.to_raw())?;
++        e.set_item("edge_kind", p.edge_kind.as_str())?;
++        e.set_item("propagated_weight", p.propagated_weight)?;
++        e.set_item("new_log_odds", p.new_log_odds)?;
++        props.append(e)?;
++    }
++    d.set_item("propagated_to", props)?;
++    Ok(d.into_any().unbind())
++}
++
++fn summary_into(py: Python<'_>, s: &RevisionSummary) -> PyResult<PyObject> {
++    let d = PyDict::new(py);
++    d.set_item("beliefs_revised", s.beliefs_revised)?;
++    d.set_item("threshold_crossings", s.threshold_crossings)?;
++    d.set_item("staleness_decays", s.staleness_decays)?;
++    d.set_item("ceiling_enforcements", s.ceiling_enforcements)?;
++    d.set_item("contradictions_found", s.contradictions_found)?;
++    d.set_item("evidence_processed", s.evidence_processed)?;
++    Ok(d.into_any().unbind())
++}
++
++fn evidence_from(
++    node_id: u32,
++    weight: f64,
++    source: &str,
++    provenance: &str,
++    propagate: bool,
++    timestamp: Option<f64>,
++    observation_id: Option<String>,
++) -> Evidence {
++    Evidence {
++        target_belief: NodeId::from_raw(node_id),
++        weight,
++        source: source.to_string(),
++        provenance: Provenance::from_str(provenance),
++        propagate,
++        timestamp: timestamp.unwrap_or_else(now_secs),
++        observation_id,
++    }
++}
++
++#[pymethods]
++impl PyYantrikDB {
++    // ── create / read ──
++
++    /// Create a belief and persist it. Returns the node id.
++    #[pyo3(signature = (proposition, prior_log_odds=0.0, domain="general", label=None, persistence=None))]
++    fn belief_create(
++        slf: &Bound<'_, Self>,
++        proposition: &str,
++        prior_log_odds: f64,
++        domain: &str,
++        label: Option<&str>,
++        persistence: Option<f64>,
++    ) -> PyResult<u32> {
++        let node = Self::detached(slf, |db| {
++            db.create_belief(proposition, prior_log_odds, domain, label, persistence)
++        })?;
++        Ok(node.id.to_raw())
++    }
++
++    /// The full stored state of one node: attributes, belief payload, the
++    /// evidence trail with each observation's earlier assessments (`history`)
++    /// and the per-path contributions of propagated origins (`paths`).
++    fn belief_get(slf: &Bound<'_, Self>, node_id: u32) -> PyResult<PyObject> {
++        let node = Self::detached(slf, |db| {
++            db.load_cognitive_node(NodeId::from_raw(node_id))
++        })?;
++        match node {
++            Some(n) => node_into(slf.py(), &n),
++            None => Ok(slf.py().None()),
++        }
++    }
++
++    /// Query beliefs with the native pattern. Only the keys given are applied.
++    #[pyo3(signature = (domain=None, min_probability=None, max_probability=None, user_confirmed_only=false, min_evidence_count=None, limit=50, order="confidence"))]
++    fn belief_query(
++        slf: &Bound<'_, Self>,
++        domain: Option<&str>,
++        min_probability: Option<f64>,
++        max_probability: Option<f64>,
++        user_confirmed_only: bool,
++        min_evidence_count: Option<u32>,
++        limit: usize,
++        order: &str,
++    ) -> PyResult<PyObject> {
++        let order = match order {
++            "confidence" => BeliefOrder::ByConfidence,
++            "evidence" => BeliefOrder::ByEvidenceCount,
++            "salience" => BeliefOrder::BySalience,
++            "volatility" => BeliefOrder::ByVolatility,
++            other => return Err(PyValueError::new_err(format!("unknown order '{other}'"))),
++        };
++        let pattern = BeliefPattern {
++            domain: domain.map(|s| s.to_string()),
++            min_probability,
++            max_probability,
++            provenance: None,
++            user_confirmed_only,
++            min_evidence_count,
++            limit,
++            order,
++        };
++        let nodes = Self::detached(slf, |db| db.query_beliefs(&pattern))?;
++        let out = PyList::empty(slf.py());
++        for n in &nodes {
++            out.append(node_into(slf.py(), n)?)?;
++        }
++        Ok(out.into_any().unbind())
++    }
++
++    /// Aggregate statistics about the belief landscape.
++    fn belief_inventory(slf: &Bound<'_, Self>) -> PyResult<PyObject> {
++        let inv: BeliefInventory = Self::detached(slf, |db| db.belief_inventory())?;
++        let py = slf.py();
++        let d = PyDict::new(py);
++        d.set_item("total_beliefs", inv.total_beliefs)?;
++        d.set_item("by_domain", inv.by_domain.clone())?;
++        d.set_item("high_confidence", inv.high_confidence)?;
++        d.set_item("uncertain", inv.uncertain)?;
++        d.set_item("user_confirmed", inv.user_confirmed)?;
++        d.set_item("contested", inv.contested)?;
++        d.set_item("avg_evidence_count", inv.avg_evidence_count)?;
++        d.set_item(
++            "most_volatile",
++            inv.most_volatile.iter().map(|(id, l, v)| (id.to_raw(), l.clone(), *v)).collect::<Vec<_>>(),
++        )?;
++        d.set_item(
++            "strongest",
++            inv.strongest.iter().map(|(id, l, v)| (id.to_raw(), l.clone(), *v)).collect::<Vec<_>>(),
++        )?;
++        d.set_item(
++            "most_contested",
++            inv.most_contested.iter().map(|(id, l, v)| (id.to_raw(), l.clone(), *v)).collect::<Vec<_>>(),
++        )?;
++        Ok(d.into_any().unbind())
++    }
++
++    /// Why this belief is held: supporting/contradicting evidence with ages,
++    /// neighbour beliefs, net support and the confidence trend.
++    fn belief_explain(slf: &Bound<'_, Self>, node_id: u32) -> PyResult<PyObject> {
++        let ex: Option<BeliefExplanation> =
++            Self::detached(slf, |db| db.explain_belief(NodeId::from_raw(node_id)))?;
++        let Some(ex) = ex else {
++            return Ok(slf.py().None());
++        };
++        let py = slf.py();
++        let d = PyDict::new(py);
++        d.set_item("belief_id", ex.belief_id.to_raw())?;
++        d.set_item("proposition", ex.proposition.clone())?;
++        d.set_item("probability", ex.probability)?;
++        d.set_item("log_odds", ex.log_odds)?;
++        d.set_item("domain", ex.domain.clone())?;
++        d.set_item("provenance", ex.provenance.as_str())?;
++        d.set_item("user_confirmed", ex.user_confirmed)?;
++        let pack = |rows: &[yantrikdb_core::belief_query::EvidenceSummary]| -> PyResult<Vec<(String, f64, f64, f64)>> {
++            Ok(rows
++                .iter()
++                .map(|e| (e.source.clone(), e.weight, e.timestamp, e.age_secs))
++                .collect())
++        };
++        d.set_item("supporting_evidence", pack(&ex.supporting_evidence)?)?;
++        d.set_item("contradicting_evidence", pack(&ex.contradicting_evidence)?)?;
++        d.set_item("net_support", ex.net_support)?;
++        d.set_item(
++            "supporting_beliefs",
++            ex.supporting_beliefs.iter().map(|(id, l, w)| (id.to_raw(), l.clone(), *w)).collect::<Vec<_>>(),
++        )?;
++        d.set_item(
++            "contradicting_beliefs",
++            ex.contradicting_beliefs.iter().map(|(id, l, w)| (id.to_raw(), l.clone(), *w)).collect::<Vec<_>>(),
++        )?;
++        d.set_item("confidence_trend", ex.confidence_trend)?;
++        d.set_item("volatility", ex.volatility)?;
++        d.set_item("age_secs", ex.age_secs)?;
++        Ok(d.into_any().unbind())
++    }
++
++    // ── evidence ──
++
++    /// Assert one observation against a belief. `observation_id` is the stable
++    /// identity of the observation: the same id revises the previous
++    /// assessment instead of voting twice.
++    #[pyo3(signature = (node_id, weight, source, provenance="observed", propagate=false, timestamp=None, observation_id=None, config=None))]
++    fn belief_assert_evidence(
++        slf: &Bound<'_, Self>,
++        node_id: u32,
++        weight: f64,
++        source: &str,
++        provenance: &str,
++        propagate: bool,
++        timestamp: Option<f64>,
++        observation_id: Option<String>,
++        config: Option<&Bound<'_, PyDict>>,
++    ) -> PyResult<PyObject> {
++        let cfg = config_from(config)?;
++        let ev = evidence_from(
++            node_id,
++            weight,
++            source,
++            provenance,
++            propagate,
++            timestamp,
++            observation_id,
++        );
++        let res = Self::detached(slf, move |db| db.assert_belief_evidence(&ev, &cfg))?;
++        match res {
++            Some(r) => evidence_result_into(slf.py(), &r),
++            None => Ok(slf.py().None()),
++        }
++    }
++
++    /// Assert several observations in one batch. Each item is a dict with the
++    /// keys of `belief_assert_evidence`.
++    #[pyo3(signature = (items, config=None))]
++    fn belief_assert_evidence_batch(
++        slf: &Bound<'_, Self>,
++        items: Vec<Bound<'_, PyDict>>,
++        config: Option<&Bound<'_, PyDict>>,
++    ) -> PyResult<PyObject> {
++        let cfg = config_from(config)?;
++        let mut batch = Vec::with_capacity(items.len());
++        for d in &items {
++            let node_id: u32 = d
++                .get_item("node_id")?
++                .or(d.get_item("belief_id")?)
++                .ok_or_else(|| PyValueError::new_err("item needs 'node_id'"))?
++                .extract()?;
++            let weight: f64 = d
++                .get_item("weight")?
++                .ok_or_else(|| PyValueError::new_err("item needs 'weight'"))?
++                .extract()?;
++            let source: String = d
++                .get_item("source")?
++                .ok_or_else(|| PyValueError::new_err("item needs 'source'"))?
++                .extract()?;
++            let provenance = opt_str(d, "provenance")?.unwrap_or_else(|| "observed".into());
++            batch.push(evidence_from(
++                node_id,
++                weight,
++                &source,
++                &provenance,
++                opt_bool(d, "propagate")?.unwrap_or(false),
++                opt_f64(d, "timestamp")?,
++                opt_str(d, "observation_id")?,
++            ));
++        }
++        let results = Self::detached(slf, move |db| db.assert_belief_evidence_batch(&batch, &cfg))?;
++        let out = PyList::empty(slf.py());
++        for r in &results {
++            out.append(evidence_result_into(slf.py(), r)?)?;
++        }
++        Ok(out.into_any().unbind())
++    }
++
++    // ── relations ──
++
++    /// Persist an epistemic edge between two beliefs. Epistemic kinds
++    /// (`supports`, `contradicts`) are the ones evidence propagates over.
++    #[pyo3(signature = (src, dst, kind="supports", weight=1.0, confidence=None))]
++    fn belief_relate(
++        slf: &Bound<'_, Self>,
++        src: u32,
++        dst: u32,
++        kind: &str,
++        weight: f64,
++        confidence: Option<f64>,
++    ) -> PyResult<bool> {
++        let kind = edge_kind(kind)?;
++        let mut edge = CognitiveEdge::new(NodeId::from_raw(src), NodeId::from_raw(dst), kind, weight);
++        if let Some(c) = confidence {
++            edge.confidence = c;
++        }
++        Self::detached(slf, move |db| db.persist_cognitive_edge(&edge))?;
++        Ok(true)
++    }
++
++    /// Edges of a node: `out`, `in` or `both`.
++    #[pyo3(signature = (node_id, direction="out"))]
++    fn belief_edges(slf: &Bound<'_, Self>, node_id: u32, direction: &str) -> PyResult<PyObject> {
++        let id = NodeId::from_raw(node_id);
++        let py = slf.py();
++        let mut edges: Vec<CognitiveEdge> = Vec::new();
++        match direction {
++            "out" => edges = Self::detached(slf, |db| db.load_cognitive_edges_from(id))?,
++            "in" => edges = Self::detached(slf, |db| db.load_cognitive_edges_to(id))?,
++            "both" => {
++                edges = Self::detached(slf, |db| db.load_cognitive_edges_from(id))?;
++                edges.extend(Self::detached(slf, |db| db.load_cognitive_edges_to(id))?);
++            }
++            other => return Err(PyValueError::new_err(format!("unknown direction '{other}'"))),
++        }
++        let out = PyList::empty(py);
++        for e in &edges {
++            let d = PyDict::new(py);
++            d.set_item("src", e.src.to_raw())?;
++            d.set_item("dst", e.dst.to_raw())?;
++            d.set_item("kind", e.kind.as_str())?;
++            d.set_item("weight", e.weight)?;
++            d.set_item("confidence", e.confidence)?;
++            d.set_item("observation_count", e.observation_count)?;
++            d.set_item("created_at_ms", e.created_at_ms)?;
++            d.set_item("last_confirmed_ms", e.last_confirmed_ms)?;
++            out.append(d)?;
++        }
++        Ok(out.into_any().unbind())
++    }
++
++    // ── revision ──
++
++    /// Confirm or refute a belief as a direct statement. Confirming shifts the
++    /// value up, refuting sets it to strong disbelief; both are recorded as
++    /// `provenance = told` and bypass nothing else.
++    fn belief_confirm(slf: &Bound<'_, Self>, node_id: u32) -> PyResult<bool> {
++        Self::detached(slf, |db| db.confirm_belief(NodeId::from_raw(node_id)))
++    }
++
++    fn belief_refute(slf: &Bound<'_, Self>, node_id: u32) -> PyResult<bool> {
++        Self::detached(slf, |db| db.refute_belief(NodeId::from_raw(node_id)))
++    }
++
++    /// Run staleness decay over every belief. `at` pins the clock (unix
++    /// seconds) so a caller can measure time-based behaviour; without it the
++    /// engine's own clock is used.
++    #[pyo3(signature = (config=None, at=None))]
++    fn belief_revise(
++        slf: &Bound<'_, Self>,
++        config: Option<&Bound<'_, PyDict>>,
++        at: Option<f64>,
++    ) -> PyResult<PyObject> {
++        let cfg = config_from(config)?;
++        let summary = match at {
++            Some(now) => Self::detached(slf, move |db| db.revise_all_beliefs_at(now, &cfg))?,
++            None => Self::detached(slf, move |db| db.revise_all_beliefs(&cfg))?,
++        };
++        summary_into(slf.py(), &summary)
++    }
++
++    /// Scan the belief graph for contradictions.
++    fn belief_contradictions(slf: &Bound<'_, Self>) -> PyResult<PyObject> {
++        let res = Self::detached(slf, |db| {
++            db.detect_belief_contradictions(&yantrikdb_core::contradiction::ContradictionConfig::default())
++        })?;
++        let py = slf.py();
++        let d = PyDict::new(py);
++        d.set_item("epistemic_conflicts", res.epistemic_conflicts)?;
++        d.set_item("conflicts", res.conflicts.len())?;
++        Ok(d.into_any().unbind())
++    }
++}
+diff --git a/crates/yantrikdb-python/src/py_engine/mod.rs b/crates/yantrikdb-python/src/py_engine/mod.rs
+index 47201eb..c9cc591 100644
+--- a/crates/yantrikdb-python/src/py_engine/mod.rs
++++ b/crates/yantrikdb-python/src/py_engine/mod.rs
+@@ -1,3 +1,4 @@
++mod belief_api;
+ mod cognition;
+ mod graph;
+ mod inspect;
+-- 
+2.47.3
+

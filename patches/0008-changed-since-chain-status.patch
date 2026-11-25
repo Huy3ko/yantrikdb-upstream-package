@@ -1,0 +1,387 @@
+From 0abc1ecbe65e6db69edf7ef9d347d1cdeca8181e Mon Sep 17 00:00:00 2001
+From: Vela <vela@localhost>
+Date: Wed, 25 Nov 2026 23:19:44 +0100
+Subject: [PATCH] fix(digest): what_changed_since reports a record's chain
+ status, not a default
+
+`DigestEntry::current_status` and `superseded_by` are documented as
+chain-derived, and `session_digest` (same file, top_decisions) already fills
+them this way. `what_changed_since` hardcoded `Default::default()` and `None`
+while reading exactly those edges into `status_transitions`, so a record
+created and superseded after `since` appeared twice in one answer with
+contradictory labels: `new_records` said Active and named no successor,
+`status_transitions` said Active -> Superseded by <rid>.
+
+A host that reads the shorter view (`new_records`) inherits the opposite of
+what happened. For a resuming session that is the wrong direction: it treats
+a replaced statement as current.
+
+The successor map is built from the transition rows already fetched. An edge
+that supersedes a record created after `since` is itself committed after
+`since` (a link cannot precede its target), so the map is complete for
+`new_records` without a second query.
+
+`disputed` is deliberately untouched (still `false`): `session_digest` fills it
+from an OPEN-conflict query, but `ChangesSince` gains no conflicts section in
+this change, and whether the flag is as-of `since` or now is a product
+decision. The sibling is named so this patch is not read as covering it.
+
+Regression: engine/tests/digest_changes.rs, three tests. Two fail without this
+change (verified by stashing digest.rs and re-running on the same tree).
+---
+ crates/yantrikdb-core/src/engine/digest.rs    |  27 +-
+ .../src/engine/tests/digest_changes.rs        | 283 ++++++++++++++++++
+ crates/yantrikdb-core/src/engine/tests/mod.rs |   1 +
+ 3 files changed, 309 insertions(+), 2 deletions(-)
+ create mode 100644 crates/yantrikdb-core/src/engine/tests/digest_changes.rs
+
+diff --git a/crates/yantrikdb-core/src/engine/digest.rs b/crates/yantrikdb-core/src/engine/digest.rs
+index 2a3636e..d9a4ab1 100644
+--- a/crates/yantrikdb-core/src/engine/digest.rs
++++ b/crates/yantrikdb-core/src/engine/digest.rs
+@@ -488,16 +488,39 @@ impl YantrikDB {
+         drop(tr_stmt);
+         drop(conn);
+ 
++        // Chain status for the records we are about to report. A record that
++        // was created after `since` and superseded later necessarily has its
++        // supersedes edge committed after its own creation, hence after
++        // `since` — so the transition scan above already covers it and this
++        // map is complete for `new_records` without a second query. Keyed by
++        // the superseded rid; the query keeps one selected successor per
++        // target, so the map holds exactly one.
++        let mut successor_of: std::collections::HashMap<String, String> =
++            std::collections::HashMap::with_capacity(tr_rows.len());
++        for (target, source, _at) in &tr_rows {
++            successor_of.insert(target.clone(), source.clone());
++        }
++
+         for (rid, enc_text, importance, created_at, ns) in rec_rows {
+             let text = self.decrypt_text(&enc_text).unwrap_or(enc_text);
++            // `DigestEntry::current_status` is documented as chain-derived:
++            // reporting the lifecycle column here would label a superseded
++            // record Active, contradicting the `status_transitions` of the
++            // very same answer.
++            let superseded_by = successor_of.get(&rid).cloned();
++            let current_status = if superseded_by.is_some() {
++                crate::types::RecordStatus::Superseded
++            } else {
++                crate::types::RecordStatus::Active
++            };
+             changes.new_records.push(DigestEntry {
+                 snippet: snip(&text, snippet_chars),
+                 rid,
+                 importance,
+                 created_at,
+                 namespace: ns,
+-                current_status: Default::default(),
+-                superseded_by: None,
++                current_status,
++                superseded_by,
+                 disputed: false,
+             });
+         }
+diff --git a/crates/yantrikdb-core/src/engine/tests/digest_changes.rs b/crates/yantrikdb-core/src/engine/tests/digest_changes.rs
+new file mode 100644
+index 0000000..74cd958
+--- /dev/null
++++ b/crates/yantrikdb-core/src/engine/tests/digest_changes.rs
+@@ -0,0 +1,283 @@
++//! Regression: `what_changed_since` must not report a superseded record as
++//! Active.
++//!
++//! A resuming session asks "what moved while I was away". A record that was
++//! created **and** superseded after `since` shows up in both lists of the
++//! answer. Before the fix the entry in `new_records` carried
++//! `current_status: Active` and `superseded_by: None` while
++//! `status_transitions` reported the very same rid as `Active → Superseded`
++//! with a successor — the packet contradicted itself, and a host that reads
++//! `new_records` (the shorter view) learns the opposite of what happened.
++//!
++//! The field doc on `DigestEntry::current_status` already promises a
++//! chain-derived status; these tests pin that promise.
++
++use super::helpers::*;
++use super::YantrikDB;
++use crate::types::{LinkDirection, LinkType, RecordLink, RecordStatus};
++
++fn record(db: &YantrikDB, text: &str) -> String {
++    db.record(
++        text,
++        "semantic",
++        0.9,
++        0.0,
++        604800.0,
++        &serde_json::json!({}),
++        &vec_seed(1.0, 8),
++        "default",
++        0.8,
++        "work",
++        "user",
++        None,
++    )
++    .unwrap()
++}
++
++/// The defect: created after `since`, superseded after `since`.
++#[test]
++fn new_record_superseded_after_since_reports_its_chain_status() {
++    let db = YantrikDB::new(":memory:", 8).unwrap();
++    let since = super::super::now();
++    std::thread::sleep(std::time::Duration::from_millis(25));
++
++    let old = record(&db, "The endpoint is v1");
++    std::thread::sleep(std::time::Duration::from_millis(25));
++    let new = record(&db, "The endpoint is v2");
++    db.link(
++        &new,
++        &RecordLink {
++            target_rid: old.clone(),
++            link_type: LinkType::Supersedes,
++        },
++    )
++    .unwrap();
++
++    let changes = db.what_changed_since(since, None, 240).unwrap();
++
++    let entry = changes
++        .new_records
++        .iter()
++        .find(|e| e.rid == old)
++        .expect("the superseded record was created after `since`");
++    assert_eq!(
++        entry.current_status,
++        RecordStatus::Superseded,
++        "a record with a selected inbound supersedes edge is not Active"
++    );
++    assert_eq!(
++        entry.superseded_by.as_deref(),
++        Some(new.as_str()),
++        "the entry must name its successor, not leave the caller to guess"
++    );
++
++    // The two lists of one answer must agree about the same record.
++    let transition = changes
++        .status_transitions
++        .iter()
++        .find(|t| t.rid == old)
++        .expect("the supersession was committed after `since`");
++    assert_eq!(transition.to, entry.current_status);
++    assert_eq!(transition.by_rid, entry.superseded_by);
++}
++
++/// The legitimate case must keep passing: an undisturbed record is Active and
++/// names no successor.
++#[test]
++fn new_record_without_successor_stays_active() {
++    let db = YantrikDB::new(":memory:", 8).unwrap();
++    let since = super::super::now();
++    std::thread::sleep(std::time::Duration::from_millis(25));
++
++    let live = record(&db, "The endpoint is v1");
++    let changes = db.what_changed_since(since, None, 240).unwrap();
++
++    let entry = changes
++        .new_records
++        .iter()
++        .find(|e| e.rid == live)
++        .expect("the record was created after `since`");
++    assert_eq!(entry.current_status, RecordStatus::Active);
++    assert_eq!(entry.superseded_by, None);
++    assert!(
++        changes.status_transitions.is_empty(),
++        "no link was written, so there is no transition to report"
++    );
++}
++
++/// The successor itself is not superseded by its own outbound edge. Guards the
++/// obvious wrong fix: mapping both endpoints of every supersedes edge.
++#[test]
++fn successor_is_not_marked_superseded_by_its_own_edge() {
++    let db = YantrikDB::new(":memory:", 8).unwrap();
++    let since = super::super::now();
++    std::thread::sleep(std::time::Duration::from_millis(25));
++
++    let old = record(&db, "The endpoint is v1");
++    std::thread::sleep(std::time::Duration::from_millis(25));
++    let new = record(&db, "The endpoint is v2");
++    db.link(
++        &new,
++        &RecordLink {
++            target_rid: old.clone(),
++            link_type: LinkType::Supersedes,
++        },
++    )
++    .unwrap();
++
++    let changes = db.what_changed_since(since, None, 240).unwrap();
++    let successor = changes
++        .new_records
++        .iter()
++        .find(|e| e.rid == new)
++        .expect("the successor was created after `since`");
++    assert_eq!(successor.current_status, RecordStatus::Active);
++    assert_eq!(successor.superseded_by, None);
++
++    // And a non-supersedes link never changes a status.
++    let note = record(&db, "A note that only relates");
++    db.link(
++        &note,
++        &RecordLink {
++            target_rid: old.clone(),
++            link_type: LinkType::DerivedFrom,
++        },
++    )
++    .unwrap();
++    let after = db.what_changed_since(since, None, 240).unwrap();
++    let old_entry = after.new_records.iter().find(|e| e.rid == old).unwrap();
++    assert_eq!(
++        old_entry.current_status,
++        RecordStatus::Superseded,
++        "an extra RelatedTo edge must not undo the supersession"
++    );
++}
++// ── Closing checks, 26.11.: multiple successors, determinism, imports ──
++
++/// The record layer keeps a single selected inbound successor per target
++/// (`gate_supersedes`). A second one is refused or stored as a losing
++/// candidate — either way the *read* path must never see two active successors.
++#[test]
++fn a_second_successor_never_becomes_a_second_active_edge() {
++    let db = YantrikDB::new(":memory:", 8).unwrap();
++    let since = super::super::now();
++    std::thread::sleep(std::time::Duration::from_millis(25));
++
++    let old = record(&db, "The endpoint is v1");
++    let n1 = record(&db, "The endpoint is v2");
++    let n2 = record(&db, "The endpoint is v2 (second attempt)");
++    db.link(&n1, &RecordLink { target_rid: old.clone(), link_type: LinkType::Supersedes })
++        .unwrap();
++    // The second attempt may be refused outright; that is the point.
++    let _ = db.link(&n2, &RecordLink { target_rid: old.clone(), link_type: LinkType::Supersedes });
++
++    let inbound = db
++        .linked_records(&old, LinkDirection::Inbound, Some(&LinkType::Supersedes))
++        .unwrap();
++    assert_eq!(inbound.len(), 1, "one selected successor, not two: {inbound:?}");
++}
++
++/// Legacy data (pre Phase-0) can violate that invariant. The change feed must
++/// still answer deterministically: the newest committed edge wins, and two
++/// calls return the same successor.
++#[test]
++fn legacy_multiple_successors_resolve_deterministically() {
++    let db = YantrikDB::new(":memory:", 8).unwrap();
++    let since = super::super::now();
++    std::thread::sleep(std::time::Duration::from_millis(25));
++
++    let old = record(&db, "The endpoint is v1");
++    let n1 = record(&db, "The endpoint is v2");
++    std::thread::sleep(std::time::Duration::from_millis(25));
++    let n2 = record(&db, "The endpoint is v2 (later)");
++    db.link(&n1, &RecordLink { target_rid: old.clone(), link_type: LinkType::Supersedes })
++        .unwrap();
++    let _ = db.link(&n2, &RecordLink { target_rid: old.clone(), link_type: LinkType::Supersedes });
++
++    // The gate refuses the second successor, so there is no row to re-select.
++    // Recreate the legacy shape explicitly: a second selected inbound edge,
++    // committed later than the first.
++    {
++        let conn = db.conn();
++        conn.execute(
++            "INSERT INTO record_links
++                 (link_id, source_rid, target_rid, link_type, status, selection_state,
++                  created_at, hlc, origin_actor)
++             VALUES (?1, ?2, ?3, 'supersedes', 'active', 'selected', ?4, x'00', 'legacy')",
++            rusqlite::params![
++                "legacy-edge-0002",
++                n2,
++                old,
++                super::super::now() + 1.0
++            ],
++        )
++        .unwrap();
++    }
++
++    let first = db.what_changed_since(since, None, 240).unwrap();
++    let second = db.what_changed_since(since, None, 240).unwrap();
++    let pick = |c: &crate::ChangesSince| {
++        c.new_records
++            .iter()
++            .find(|e| e.rid == old)
++            .and_then(|e| e.superseded_by.clone())
++    };
++    assert!(pick(&first).is_some(), "legacy row still reports a successor");
++    assert_eq!(pick(&first), pick(&second), "two calls, same answer");
++    assert_eq!(
++        pick(&first).as_deref(),
++        Some(n2.as_str()),
++        "the newest committed edge wins — documented, not incidental"
++    );
++}
++
++/// Imported records carry a caller-supplied `created_at` (event time). They must
++/// not appear as "new since T", but a supersession committed now is a real
++/// change and must be reported — for a record the caller never saw arrive.
++#[test]
++fn imported_records_keep_event_time_and_still_report_later_supersession() {
++    let db = YantrikDB::new(":memory:", 8).unwrap();
++    let now = super::super::now();
++    let since = now - 3600.0;
++
++    let imported = db
++        .record_with_idempotency(
++            "Imported measurement from last month",
++            "semantic",
++            0.8,
++            0.0,
++            604800.0,
++            &serde_json::json!({}),
++            &vec_seed(1.0, 8),
++            "default",
++            0.8,
++            "work",
++            "import",
++            None,
++            None,
++            Some(now - 86400.0 * 30.0),
++        )
++        .unwrap();
++    let successor = record(&db, "Corrected measurement, imported today");
++
++    let before = db.what_changed_since(since, None, 240).unwrap();
++    assert!(
++        !before.new_records.iter().any(|e| e.rid == imported),
++        "a backdated import was not created in the last hour"
++    );
++
++    db.link(&successor, &RecordLink { target_rid: imported.clone(), link_type: LinkType::Supersedes })
++        .unwrap();
++    let after = db.what_changed_since(since, None, 240).unwrap();
++    let tr = after
++        .status_transitions
++        .iter()
++        .find(|t| t.rid == imported)
++        .expect("the supersession happened now, whatever the record's event time");
++    assert_eq!(tr.by_rid.as_deref(), Some(successor.as_str()));
++
++    // The imported record is not in new_records, yet the transition list marks
++    // it superseded. The asymmetry is the documented behaviour: the two lists
++    // answer different questions (what arrived / what moved).
++    assert!(!after.new_records.iter().any(|e| e.rid == imported));
++}
+diff --git a/crates/yantrikdb-core/src/engine/tests/mod.rs b/crates/yantrikdb-core/src/engine/tests/mod.rs
+index 62ff3bd..841d7cd 100644
+--- a/crates/yantrikdb-core/src/engine/tests/mod.rs
++++ b/crates/yantrikdb-core/src/engine/tests/mod.rs
+@@ -22,6 +22,7 @@ mod consolidate_cluster;
+ mod corrections;
+ mod created_at;
+ mod dimensions;
++mod digest_changes;
+ mod drafted_facts;
+ mod encryption;
+ // 0.13.2: 'encrypted means encrypted', verified against the raw file
+-- 
+2.47.3
+

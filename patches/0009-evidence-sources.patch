@@ -1,0 +1,1378 @@
+From 7a49e42f3adbcfd405288655b4f9e84a92f21c43 Mon Sep 17 00:00:00 2001
+From: Vela <vela@localhost>
+Date: Wed, 25 Nov 2026 23:41:55 +0100
+Subject: [PATCH] feat(belief): evidence provenance in both directions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A belief's evidence trail said what was observed, never on which records the
+observation rested. The citation lived in a free-text `source` string, so the
+chain "which experience carries this evidence" broke exactly where an audit
+needs it. This adds the missing half in both directions: which records (and
+which revision of each) a belief rests on, and which beliefs depend on a
+given record.
+
+Storage is normalised — `belief_evidence_sources`, one row per
+(belief, observation, record). Two parallel lists of rids and revision numbers
+inside the belief payload would drift apart the first time one is written
+without the other; a row cannot.
+
+Invariants and where they are pinned (engine/tests/belief_sources.rs):
+
+- Observation identity stays separate from source identity. Several records
+  under one `observation_id` are several citations of ONE observation. The
+  trail keeps one entry; the weight stays in the payload.
+- Provenance is not weight. Citing three records moves `log_odds` exactly as
+  much as citing one (bit-identical confidence).
+- A new record revision is not a new experience. When a cited record is
+  corrected and re-asserted under a fresh `observation_id`, the call is folded
+  into the observation that already cites that record and the result says so
+  (`folded_into_observation`). Without this, fixing a typo in a source would
+  double the confidence. A *different* record is unaffected and remains
+  independent evidence.
+- A citation is a historical fact. `source_revision` is the revision at
+  citation time; a later `correct()` bumps the record and leaves the row
+  alone. The read path reports `revision_drift` — a signal to review, not to
+  disbelieve.
+- A retracted source stays a source. `forget()` tombstones the record; the
+  citation survives, the reverse lookup still finds the dependent beliefs, and
+  confidence does not move.
+- Re-citing the same (belief, observation, record) is idempotent.
+- Evidence update and citations land in ONE transaction, so a half-written
+  provenance cannot look complete. An unknown rid is rejected before any write.
+- Beliefs without citations stay compatible: no rows, no behaviour change.
+
+`persist_cognitive_node` keeps its signature; the row writer moved into a
+private helper so the new path can write both tables inside one transaction
+without acquiring the connection mutex twice.
+
+Not included: `belief_assert_evidence_batch` gains no sources (one observation
+per call is the contract here), and nothing reduces a belief's confidence when
+a source is retracted — that decision is separate from making the dependency
+visible.
+
+Measured: 14 Rust tests; without the fold guard the re-citation test fails.
+---
+ crates/yantrikdb-core/src/base/schema.rs      |  28 +
+ crates/yantrikdb-core/src/cognition/belief.rs |   7 +
+ crates/yantrikdb-core/src/engine/belief.rs    |  62 ++-
+ .../src/engine/belief_sources.rs              | 239 +++++++++
+ .../yantrikdb-core/src/engine/graph_state.rs  | 175 ++++--
+ crates/yantrikdb-core/src/engine/mod.rs       |   2 +
+ .../src/engine/tests/belief_sources.rs        | 507 ++++++++++++++++++
+ crates/yantrikdb-core/src/engine/tests/mod.rs |   1 +
+ crates/yantrikdb-core/src/lib.rs              |   1 +
+ .../src/py_engine/belief_api.rs               | 103 +++-
+ 10 files changed, 1074 insertions(+), 51 deletions(-)
+ create mode 100644 crates/yantrikdb-core/src/engine/belief_sources.rs
+ create mode 100644 crates/yantrikdb-core/src/engine/tests/belief_sources.rs
+
+diff --git a/crates/yantrikdb-core/src/base/schema.rs b/crates/yantrikdb-core/src/base/schema.rs
+index 8625488..2eb9b6a 100644
+--- a/crates/yantrikdb-core/src/base/schema.rs
++++ b/crates/yantrikdb-core/src/base/schema.rs
+@@ -1644,6 +1644,34 @@ CREATE TABLE IF NOT EXISTS cognitive_edges (
+ CREATE INDEX IF NOT EXISTS idx_cognitive_edges_dst ON cognitive_edges(dst_id);
+ CREATE INDEX IF NOT EXISTS idx_cognitive_edges_kind ON cognitive_edges(kind);
+ 
++-- Belief evidence sources (candidate 0009): which records — and which revision
++-- of each — an observation rests on. Normalised on purpose: one row per
++-- (belief, observation, record) carries its own revision number, so there are
++-- no parallel rid/rev vectors that can drift apart. `observation_id` is the
++-- stable identity of the observation (0004); several rows under one
++-- observation are several citations of ONE observation, never extra votes —
++-- the evidence weight lives in the belief payload and is not derived from
++-- here. `source_revision` is the record's revision AT CITATION TIME (0 =
++-- original): a later `correct()` bumps the record's revision and leaves this
++-- row alone, which is what makes the original provenance survive a
++-- correction. Rows are never deleted by `forget()`: a retracted source stays
++-- traceable so a dependent belief can be found and reviewed.
++CREATE TABLE IF NOT EXISTS belief_evidence_sources (
++    belief_id       INTEGER NOT NULL,
++    observation_id  TEXT    NOT NULL,
++    source_rid      TEXT    NOT NULL,
++    source_revision INTEGER NOT NULL DEFAULT 0,
++    namespace       TEXT    NOT NULL DEFAULT 'default',
++    created_at      REAL    NOT NULL,
++    hlc             BLOB,
++    origin_actor    TEXT    NOT NULL,
++    PRIMARY KEY (belief_id, observation_id, source_rid)
++);
++CREATE INDEX IF NOT EXISTS idx_bes_belief
++    ON belief_evidence_sources(belief_id, observation_id);
++CREATE INDEX IF NOT EXISTS idx_bes_source
++    ON belief_evidence_sources(namespace, source_rid, belief_id);
++
+ -- High-water marks for NodeId allocator (V12)
+ CREATE TABLE IF NOT EXISTS cognitive_node_hwm (
+     kind TEXT PRIMARY KEY,                   -- node kind string
+diff --git a/crates/yantrikdb-core/src/cognition/belief.rs b/crates/yantrikdb-core/src/cognition/belief.rs
+index c8d8d0c..022eb02 100644
+--- a/crates/yantrikdb-core/src/cognition/belief.rs
++++ b/crates/yantrikdb-core/src/cognition/belief.rs
+@@ -71,6 +71,12 @@ pub struct EvidenceResult {
+     pub threshold_direction: Option<ThresholdDirection>,
+     /// Beliefs affected by propagation (if propagate=true).
+     pub propagated_to: Vec<PropagationEffect>,
++    /// Set when the assertion named an `observation_id` that already belongs to
++    /// another observation of this belief **through the same source record**.
++    /// A new record revision is not a new experience: the call was folded into
++    /// the existing observation (revised, not added), and this carries that
++    /// observation's id so the caller can see where its evidence landed.
++    pub folded_into_observation: Option<String>,
+ }
+ 
+ /// Direction of a threshold crossing.
+@@ -267,6 +273,7 @@ pub fn assert_evidence(
+         crossed_threshold: threshold_direction.is_some(),
+         threshold_direction,
+         propagated_to: vec![], // Propagation handled separately
++        folded_into_observation: None,
+     })
+ }
+ 
+diff --git a/crates/yantrikdb-core/src/engine/belief.rs b/crates/yantrikdb-core/src/engine/belief.rs
+index 1550a17..9385cf1 100644
+--- a/crates/yantrikdb-core/src/engine/belief.rs
++++ b/crates/yantrikdb-core/src/engine/belief.rs
+@@ -13,6 +13,7 @@ use crate::belief::{
+ use crate::belief_query::{self, BeliefExplanation, BeliefInventory, BeliefPattern};
+ use crate::contradiction::{self, ContradictionConfig, ContradictionScanResult};
+ use crate::error::Result;
++use super::belief_sources::EvidenceCitation;
+ use crate::state::{BeliefPayload, CognitiveEdgeKind, CognitiveNode, NodeId, NodeKind, NodePayload};
+ 
+ use super::{now, YantrikDB};
+@@ -31,20 +32,73 @@ impl YantrikDB {
+         evidence: &Evidence,
+         config: &BeliefRevisionConfig,
+     ) -> Result<Option<EvidenceResult>> {
++        self.assert_belief_evidence_with_sources(evidence, &[], config)
++    }
++
++    /// Assert one observation **together with the records it rests on**.
++    ///
++    /// The sources are provenance, not weight: they are written in the same
++    /// transaction as the evidence entry and never touch `log_odds`. Three
++    /// citations of one observation are one observation with three records
++    /// behind it — not three votes (that is what `observation_id` guarantees
++    /// since candidate 0004).
++    ///
++    /// Requires `evidence.observation_id`: without a stable identity there is
++    /// nothing to hang several citations on, and a repeat could not be told
++    /// apart from a new observation.
++    ///
++    /// Unknown rids are rejected with `NotFound` before anything is written,
++    /// so a typo cannot leave a citation pointing at a record that never
++    /// existed. A source may be *retracted* later; that is a state, not an
++    /// absence, and it stays traceable — see `beliefs_for_source`.
++    pub fn assert_belief_evidence_with_sources(
++        &self,
++        evidence: &Evidence,
++        sources: &[EvidenceCitation],
++        config: &BeliefRevisionConfig,
++    ) -> Result<Option<EvidenceResult>> {
++        let mut citations = self.resolve_citations(evidence, sources)?;
++
++        // A new record revision is not a new experience. If this belief already
++        // cites one of the given records, the call is a re-assertion of that
++        // same experience — fold it into the observation that already carries
++        // the citation instead of opening a second voice. Without this, fixing a
++        // typo in a source record and re-citing it would double the confidence.
++        let mut effective = evidence.clone();
++        let mut folded_into = None;
++        for (rid, _, _, _) in &citations {
++            if let Some(existing) = self.observation_citing(evidence.target_belief, rid)? {
++                if effective.observation_id.as_deref() != Some(existing.as_str()) {
++                    folded_into = Some(existing.clone());
++                    effective.observation_id = Some(existing.clone());
++                    for c in citations.iter_mut() {
++                        c.1 = existing.clone();
++                    }
++                }
++                break;
++            }
++        }
++
+         // Load the target belief node
+-        let mut node = match self.load_cognitive_node(evidence.target_belief)? {
++        let mut node = match self.load_cognitive_node(effective.target_belief)? {
+             Some(n) => n,
+             None => return Ok(None),
+         };
+ 
+         // Apply Bayesian update
+-        let mut result = match assert_evidence(&mut node, evidence, config) {
++        let mut result = match assert_evidence(&mut node, &effective, config) {
+             Some(r) => r,
+             None => return Ok(None),
+         };
+ 
+-        // Persist the updated belief
+-        self.persist_cognitive_node(&node)?;
++        // Persist the updated belief — and its citations, atomically.
++        if citations.is_empty() {
++            self.persist_cognitive_node(&node)?;
++        } else {
++            self.persist_cognitive_node_with_sources(&node, &citations)?;
++        }
++
++        result.folded_into_observation = folded_into;
+ 
+         // Handle evidence propagation if requested
+         if evidence.propagate {
+diff --git a/crates/yantrikdb-core/src/engine/belief_sources.rs b/crates/yantrikdb-core/src/engine/belief_sources.rs
+new file mode 100644
+index 0000000..4cede08
+--- /dev/null
++++ b/crates/yantrikdb-core/src/engine/belief_sources.rs
+@@ -0,0 +1,239 @@
++//! Evidence provenance in both directions — candidate 0009.
++//!
++//! A belief's evidence trail says *what* was observed. This module records and
++//! answers *on which records* that observation rested, and the reverse:
++//! *which beliefs rest on this record / this revision*.
++//!
++//! Layout is normalised on purpose (`belief_evidence_sources`, one row per
++//! `(belief, observation, record)`), not two parallel lists of rids and
++//! revision numbers in the belief payload: parallel vectors drift apart the
++//! first time one of them is written without the other.
++//!
++//! Three properties this module must never break:
++//!
++//! - **Provenance is not weight.** No function here touches `log_odds`,
++//!   `confidence` or the evidence trail. Citing three records for one
++//!   observation changes what can be audited, not what is believed.
++//! - **A citation is a historical fact.** `source_revision` is the record's
++//!   revision *at citation time*. A later `correct()` bumps the record and
++//!   leaves the citation alone; the read path reports the drift
++//!   (`revision_drift`) instead of rewriting history.
++//! - **A retracted source is still a source.** `forget()` tombstone the record;
++//!   the citation row survives, and the reverse lookup still finds the beliefs
++//!   that depended on it. Whether that *changes* a belief is a separate
++//!   decision — revision needed is not the same as refuted.
++
++use rusqlite::params;
++
++use crate::error::Result;
++use crate::state::NodeId;
++
++use super::YantrikDB;
++
++/// One record cited as a source of an observation.
++#[derive(Debug, Clone, PartialEq)]
++pub struct EvidenceCitation {
++    /// Record rid.
++    pub rid: String,
++    /// The revision the caller saw. `None` = the record's current revision at
++    /// citation time (0 when it was never corrected).
++    pub revision: Option<u32>,
++}
++
++/// One row of `belief_evidence_sources`, resolved against the live store.
++#[derive(Debug, Clone, serde::Serialize)]
++pub struct BeliefSourceRow {
++    pub belief_id: i64,
++    /// The belief's proposition (empty when the node is gone).
++    pub proposition: String,
++    pub observation_id: String,
++    pub source_rid: String,
++    /// The revision cited, at citation time.
++    pub source_revision: i64,
++    /// The record's revision now. Greater than `source_revision` after a
++    /// correction — the signal for "review this evidence", not for "disbelieve
++    /// it".
++    pub current_revision: i64,
++    pub revision_drift: bool,
++    /// Namespace of the *source record* (beliefs themselves carry none).
++    pub namespace: String,
++    /// `live` | `superseded` | `retracted` | `missing`
++    pub source_state: String,
++    pub confidence: f64,
++    pub cited_at: f64,
++}
++
++/// Columns every provenance query returns, in order.
++const SELECT_SOURCES: &str = "\
++SELECT b.belief_id, COALESCE(n.label, ''), b.observation_id, b.source_rid, \
++       b.source_revision, b.namespace, b.created_at, COALESCE(n.confidence, 0.0), \
++       (SELECT COALESCE(MAX(r.revision_num), 0) \
++          FROM record_revisions r WHERE r.rid = b.source_rid), \
++       m.rid IS NOT NULL, COALESCE(m.consolidation_status, ''), \
++       EXISTS(SELECT 1 FROM record_links l \
++               WHERE l.target_rid = b.source_rid \
++                 AND l.link_type = 'supersedes' AND l.status = 'active' \
++                 AND l.selection_state = 'selected') \
++FROM belief_evidence_sources b \
++LEFT JOIN cognitive_nodes n ON n.node_id = b.belief_id \
++LEFT JOIN memories m ON m.rid = b.source_rid ";
++
++fn row_to_source(r: &rusqlite::Row<'_>) -> rusqlite::Result<BeliefSourceRow> {
++    let source_revision: i64 = r.get(4)?;
++    let current_revision: i64 = r.get(8)?;
++    let present: i64 = r.get(9)?;
++    let status: String = r.get(10)?;
++    let superseded: i64 = r.get(11)?;
++
++    let source_state = if present == 0 {
++        "missing"
++    } else if status == "tombstoned" {
++        "retracted"
++    } else if superseded != 0 {
++        "superseded"
++    } else {
++        "live"
++    };
++
++    Ok(BeliefSourceRow {
++        belief_id: r.get(0)?,
++        proposition: r.get(1)?,
++        observation_id: r.get(2)?,
++        source_rid: r.get(3)?,
++        source_revision,
++        current_revision,
++        revision_drift: current_revision > source_revision,
++        namespace: r.get(5)?,
++        source_state: source_state.to_string(),
++        confidence: r.get(7)?,
++        cited_at: r.get(6)?,
++    })
++}
++
++impl YantrikDB {
++    /// Turn the caller's sources into citation rows `(rid, observation_id,
++    /// revision, namespace)`, resolving the record's current revision and
++    /// namespace. Fails before any write when a rid is unknown.
++    pub(crate) fn resolve_citations(
++        &self,
++        evidence: &crate::belief::Evidence,
++        sources: &[EvidenceCitation],
++    ) -> Result<Vec<(String, String, u32, String)>> {
++        if sources.is_empty() {
++            return Ok(Vec::new());
++        }
++        let obs = evidence.observation_id.as_deref().ok_or_else(|| {
++            crate::error::YantrikDbError::InvalidInput(
++                "evidence sources need an observation_id: without it the citations cannot be \
++                 attached to one observation, and a repeat would look like a new observation"
++                    .into(),
++            )
++        })?;
++
++        let mut out = Vec::with_capacity(sources.len());
++        {
++            let conn = self.conn();
++            let mut stmt = conn.prepare_cached(
++                "SELECT m.namespace, \
++                        (SELECT COALESCE(MAX(r.revision_num), 0) \
++                           FROM record_revisions r WHERE r.rid = m.rid) \
++                 FROM memories m WHERE m.rid = ?1",
++            )?;
++            for s in sources {
++                use rusqlite::OptionalExtension;
++                let row: Option<(String, i64)> = stmt
++                    .query_row(params![s.rid.as_str()], |r| {
++                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
++                    })
++                    .optional()?;
++                let (ns, current_rev) = row.ok_or_else(|| {
++                    crate::error::YantrikDbError::NotFound(format!(
++                        "evidence source '{}' does not exist — a citation must point at a record \
++                         that was readable when the observation was made",
++                        s.rid
++                    ))
++                })?;
++                let rev = s.revision.unwrap_or(current_rev as u32);
++                out.push((s.rid.clone(), obs.to_string(), rev, ns));
++            }
++        }
++        Ok(out)
++    }
++
++    /// The observation of `belief_id` that already cites `source_rid`, if any.
++    /// Used to keep one experience from voting twice: a record corrected and
++    /// re-cited under a fresh `observation_id` is the same experience.
++    pub(crate) fn observation_citing(
++        &self,
++        belief_id: NodeId,
++        source_rid: &str,
++    ) -> Result<Option<String>> {
++        use rusqlite::OptionalExtension;
++        let conn = self.conn();
++        let mut stmt = conn.prepare_cached(
++            "SELECT observation_id FROM belief_evidence_sources \
++             WHERE belief_id = ?1 AND source_rid = ?2 \
++             ORDER BY created_at ASC LIMIT 1",
++        )?;
++        Ok(stmt
++            .query_row(params![belief_id.to_raw() as i64, source_rid], |r| {
++                r.get::<_, String>(0)
++            })
++            .optional()?)
++    }
++
++    /// Forward: which records does this belief rest on (optionally only one
++    /// observation)? Oldest citation first.
++    pub fn belief_sources(
++        &self,
++        belief_id: NodeId,
++        observation_id: Option<&str>,
++        namespace: Option<&str>,
++    ) -> Result<Vec<BeliefSourceRow>> {
++        let mut sql = String::from(SELECT_SOURCES);
++        sql.push_str("WHERE b.belief_id = ?1");
++        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> =
++            vec![Box::new(belief_id.to_raw() as i64)];
++        if let Some(o) = observation_id {
++            values.push(Box::new(o.to_string()));
++            sql.push_str(&format!(" AND b.observation_id = ?{}", values.len()));
++        }
++        if let Some(ns) = namespace {
++            values.push(Box::new(ns.to_string()));
++            sql.push_str(&format!(" AND b.namespace = ?{}", values.len()));
++        }
++        sql.push_str(" ORDER BY b.created_at ASC, b.source_rid ASC");
++
++        let conn = self.conn();
++        let mut stmt = conn.prepare(&sql)?;
++        let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
++        let rows = stmt.query_map(refs.as_slice(), row_to_source)?;
++        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
++    }
++
++    /// Reverse: which beliefs depend on this record? Optionally scoped to the
++    /// namespace the citation was made in.
++    ///
++    /// Works for retracted and superseded sources too — that is the point:
++    /// a withdrawn record must not become invisible as a dependency.
++    pub fn beliefs_for_source(
++        &self,
++        source_rid: &str,
++        namespace: Option<&str>,
++    ) -> Result<Vec<BeliefSourceRow>> {
++        let mut sql = String::from(SELECT_SOURCES);
++        sql.push_str("WHERE b.source_rid = ?1");
++        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(source_rid.to_string())];
++        if let Some(ns) = namespace {
++            values.push(Box::new(ns.to_string()));
++            sql.push_str(&format!(" AND b.namespace = ?{}", values.len()));
++        }
++        sql.push_str(" ORDER BY b.belief_id ASC, b.created_at ASC");
++
++        let conn = self.conn();
++        let mut stmt = conn.prepare(&sql)?;
++        let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
++        let rows = stmt.query_map(refs.as_slice(), row_to_source)?;
++        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
++    }
++}
+diff --git a/crates/yantrikdb-core/src/engine/graph_state.rs b/crates/yantrikdb-core/src/engine/graph_state.rs
+index cca9847..d0d30d9 100644
+--- a/crates/yantrikdb-core/src/engine/graph_state.rs
++++ b/crates/yantrikdb-core/src/engine/graph_state.rs
+@@ -89,60 +89,144 @@ impl YantrikDB {
+     /// is an upsert. All attributes, payload, and metadata are written.
+     /// Also updates the high-water mark for this node's kind.
+     pub fn persist_cognitive_node(&self, node: &CognitiveNode) -> Result<()> {
++        let ts = now_secs();
++        let hlc_bytes = self.tick_hlc().to_bytes();
++
++        {
++            let conn = self.conn();
++            Self::write_node_row(&conn, node, ts, &hlc_bytes, &self.actor_id)?;
++        }
++
++        self.log_op(
++            "cognitive_node_upsert",
++            None,
++            &serde_json::json!({
++                "node_id": node.id.to_raw(),
++                "kind": node.kind().as_str(),
++                "label": node.label,
++            }),
++            None,
++        )?;
++
++        Ok(())
++    }
++
++    /// Write the `cognitive_nodes` row and the kind high-water mark on an
++    /// already-open connection.
++    ///
++    /// Split out of `persist_cognitive_node` for callers that must write a
++    /// second table in the same transaction (evidence citations). They cannot
++    /// call the public method from inside their transaction: `conn()` hands
++    /// out a `MutexGuard`, and a second acquisition deadlocks.
++    fn write_node_row(
++        conn: &rusqlite::Connection,
++        node: &CognitiveNode,
++        ts: f64,
++        hlc_bytes: &[u8],
++        actor: &str,
++    ) -> Result<()> {
+         let payload_json = serialize_payload(&node.payload).to_string();
+         let metadata_json = serde_json::to_string(&node.metadata).unwrap_or_else(|_| "{}".into());
++
++        conn.execute(
++            "INSERT OR REPLACE INTO cognitive_nodes (
++                node_id, kind, label,
++                confidence, activation, salience, persistence, valence,
++                urgency, novelty, volatility, provenance, evidence_count,
++                last_updated_ms, payload, metadata,
++                created_at, tombstoned, hlc, origin_actor
++            ) VALUES (
++                ?1, ?2, ?3,
++                ?4, ?5, ?6, ?7, ?8,
++                ?9, ?10, ?11, ?12, ?13,
++                ?14, ?15, ?16,
++                ?17, 0, ?18, ?19
++            )",
++            params![
++                node.id.to_raw() as i64,
++                node.kind().as_str(),
++                node.label,
++                node.attrs.confidence,
++                node.attrs.activation,
++                node.attrs.salience,
++                node.attrs.persistence,
++                node.attrs.valence,
++                node.attrs.urgency,
++                node.attrs.novelty,
++                node.attrs.volatility,
++                node.attrs.provenance.as_str(),
++                node.attrs.evidence_count,
++                node.attrs.last_updated_ms as i64,
++                payload_json,
++                metadata_json,
++                ts,
++                hlc_bytes,
++                actor,
++            ],
++        )?;
++
++        // Update high-water mark
++        let seq = node.id.seq();
++        conn.execute(
++            "INSERT INTO cognitive_node_hwm (kind, high_water_mark)
++             VALUES (?1, ?2)
++             ON CONFLICT(kind) DO UPDATE SET
++                high_water_mark = MAX(high_water_mark, excluded.high_water_mark)",
++            params![node.kind().as_str(), seq],
++        )?;
++
++        Ok(())
++    }
++
++    /// Persist one cognitive node **and** the records its new evidence cites,
++    /// in a single transaction.
++    ///
++    /// `citations` are `(source_rid, observation_id, source_revision,
++    /// namespace)`. Atomicity matters: an evidence entry whose provenance is
++    /// half written looks complete to the next reader, and a citation without
++    /// its observation points at evidence that does not exist.
++    ///
++    /// Returns the number of newly inserted citations. Re-citing an existing
++    /// `(belief, observation, source)` triple inserts nothing — the citation is
++    /// a historical fact (what was seen, at which revision), so the first one
++    /// stands and a repeat is idempotent rather than an overwrite.
++    pub fn persist_cognitive_node_with_sources(
++        &self,
++        node: &CognitiveNode,
++        citations: &[(String, String, u32, String)],
++    ) -> Result<usize> {
+         let ts = now_secs();
+         let hlc_bytes = self.tick_hlc().to_bytes();
+ 
+-        {
++        let inserted = {
+             let conn = self.conn();
+-            conn.execute(
+-                "INSERT OR REPLACE INTO cognitive_nodes (
+-                    node_id, kind, label,
+-                    confidence, activation, salience, persistence, valence,
+-                    urgency, novelty, volatility, provenance, evidence_count,
+-                    last_updated_ms, payload, metadata,
+-                    created_at, tombstoned, hlc, origin_actor
+-                ) VALUES (
+-                    ?1, ?2, ?3,
+-                    ?4, ?5, ?6, ?7, ?8,
+-                    ?9, ?10, ?11, ?12, ?13,
+-                    ?14, ?15, ?16,
+-                    ?17, 0, ?18, ?19
+-                )",
+-                params![
++            let tx = conn.unchecked_transaction()?;
++            Self::write_node_row(&tx, node, ts, &hlc_bytes, &self.actor_id)?;
++
++            let mut stmt = tx.prepare_cached(
++                "INSERT INTO belief_evidence_sources (
++                    belief_id, observation_id, source_rid, source_revision,
++                    namespace, created_at, hlc, origin_actor
++                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
++                 ON CONFLICT(belief_id, observation_id, source_rid) DO NOTHING",
++            )?;
++            let mut inserted = 0usize;
++            for (rid, obs, rev, ns) in citations {
++                inserted += stmt.execute(params![
+                     node.id.to_raw() as i64,
+-                    node.kind().as_str(),
+-                    node.label,
+-                    node.attrs.confidence,
+-                    node.attrs.activation,
+-                    node.attrs.salience,
+-                    node.attrs.persistence,
+-                    node.attrs.valence,
+-                    node.attrs.urgency,
+-                    node.attrs.novelty,
+-                    node.attrs.volatility,
+-                    node.attrs.provenance.as_str(),
+-                    node.attrs.evidence_count,
+-                    node.attrs.last_updated_ms as i64,
+-                    payload_json,
+-                    metadata_json,
++                    obs,
++                    rid,
++                    *rev as i64,
++                    ns,
+                     ts,
+                     hlc_bytes,
+                     self.actor_id,
+-                ],
+-            )?;
+-
+-            // Update high-water mark
+-            let seq = node.id.seq();
+-            conn.execute(
+-                "INSERT INTO cognitive_node_hwm (kind, high_water_mark)
+-                 VALUES (?1, ?2)
+-                 ON CONFLICT(kind) DO UPDATE SET
+-                    high_water_mark = MAX(high_water_mark, excluded.high_water_mark)",
+-                params![node.kind().as_str(), seq],
+-            )?;
+-        }
++                ])?;
++            }
++            drop(stmt);
++            tx.commit()?;
++            inserted
++        };
+ 
+         self.log_op(
+             "cognitive_node_upsert",
+@@ -151,11 +235,12 @@ impl YantrikDB {
+                 "node_id": node.id.to_raw(),
+                 "kind": node.kind().as_str(),
+                 "label": node.label,
++                "sources_cited": inserted,
+             }),
+             None,
+         )?;
+ 
+-        Ok(())
++        Ok(inserted)
+     }
+ 
+     /// Load a single cognitive node by its ID. Returns None if not found or tombstoned.
+diff --git a/crates/yantrikdb-core/src/engine/mod.rs b/crates/yantrikdb-core/src/engine/mod.rs
+index 81a228d..ec2161e 100644
+--- a/crates/yantrikdb-core/src/engine/mod.rs
++++ b/crates/yantrikdb-core/src/engine/mod.rs
+@@ -3,6 +3,8 @@ mod agenda;
+ mod analogy_engine;
+ mod audit;
+ mod belief;
++pub mod belief_sources;
++pub use belief_sources::{BeliefSourceRow, EvidenceCitation};
+ mod belief_network_engine;
+ mod bitemporal;
+ mod cache;
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_sources.rs b/crates/yantrikdb-core/src/engine/tests/belief_sources.rs
+new file mode 100644
+index 0000000..c739d13
+--- /dev/null
++++ b/crates/yantrikdb-core/src/engine/tests/belief_sources.rs
+@@ -0,0 +1,507 @@
++//! Candidate 0009 — evidence provenance in both directions.
++//!
++//! Every test below pins one of the invariants the feature must not break.
++//! The weight tests matter most: provenance is audit, not belief. If citing
++//! three records moved `log_odds`, a well-documented observation would count
++//! more than a sparsely documented one, and the belief would answer to how
++//! much paper exists rather than to what was seen.
++
++use super::helpers::*;
++use super::YantrikDB;
++use crate::belief::{BeliefRevisionConfig, Evidence};
++use crate::engine::belief_sources::EvidenceCitation;
++use crate::state::NodeId;
++
++/// Deterministic embedder, so `correct(new_text=…)` can re-embed as the
++/// production path does. Without it the store has no embedder at all and a
++/// text correction fails with `NoEmbedder` — a property of the fixture, not of
++/// the feature under test.
++struct Dummy;
++
++impl crate::types::Embedder for Dummy {
++    fn embed(
++        &self,
++        _t: &str,
++    ) -> std::result::Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
++        Ok(vec_seed(1.0, 8))
++    }
++
++    fn dim(&self) -> usize {
++        8
++    }
++}
++
++fn open_db() -> YantrikDB {
++    let mut db = YantrikDB::new(":memory:", 8).unwrap();
++    db.set_embedder(Box::new(Dummy)).unwrap();
++    db
++}
++
++fn record_in(db: &YantrikDB, text: &str, ns: &str) -> String {
++    db.record(
++        text,
++        "episodic",
++        0.8,
++        0.0,
++        1_000_000_000.0,
++        &serde_json::json!({}),
++        &vec_seed(1.0, 8),
++        ns,
++        0.8,
++        "work",
++        "observation",
++        None,
++    )
++    .unwrap()
++}
++
++fn belief(db: &YantrikDB, prop: &str) -> NodeId {
++    db.create_belief(prop, 0.0, "provenance", None, None)
++        .unwrap()
++        .id
++}
++
++fn evidence_on(id: NodeId, weight: f64, obs: &str) -> Evidence {
++    Evidence {
++        target_belief: id,
++        weight,
++        source: "test".into(),
++        provenance: crate::state::Provenance::Observed,
++        propagate: false,
++        timestamp: super::super::now(),
++        observation_id: Some(obs.to_string()),
++    }
++}
++
++fn cfg() -> BeliefRevisionConfig {
++    BeliefRevisionConfig::default()
++}
++
++fn probability(db: &YantrikDB, id: NodeId) -> f64 {
++    db.load_cognitive_node(id).unwrap().unwrap().attrs.confidence
++}
++
++// ── 1. Forward: several records under ONE observation ────────────────
++
++#[test]
++fn one_observation_can_cite_several_records() {
++    let db = open_db();
++    let b = belief(&db, "The endpoint is v2");
++    let m1 = record_in(&db, "Measurement: 194 methods on api2", "a");
++    let m2 = record_in(&db, "Manifest: build api2 from d32f219", "a");
++
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(b, 2.0, "obs-1"),
++        &[
++            EvidenceCitation { rid: m1.clone(), revision: None },
++            EvidenceCitation { rid: m2.clone(), revision: None },
++        ],
++        &cfg(),
++    )
++    .unwrap()
++    .unwrap();
++
++    let rows = db.belief_sources(b, None, None).unwrap();
++    assert_eq!(rows.len(), 2, "both records are cited, under one observation");
++    assert!(rows.iter().all(|r| r.observation_id == "obs-1"));
++    assert!(rows.iter().all(|r| r.source_state == "live"));
++
++    // The belief keeps ONE evidence entry: several citations are not votes.
++    let node = db.load_cognitive_node(b).unwrap().unwrap();
++    let crate::state::NodePayload::Belief(p) = &node.payload else { panic!() };
++    assert_eq!(p.evidence_trail.len(), 1);
++}
++
++// ── 2. Provenance is not weight ──────────────────────────────────────
++
++#[test]
++fn citing_more_sources_does_not_change_confidence() {
++    let db = open_db();
++    let one = belief(&db, "with one source");
++    let three = belief(&db, "with three sources");
++    let r = record_in(&db, "single record", "a");
++    let r2 = record_in(&db, "second record", "a");
++    let r3 = record_in(&db, "third record", "a");
++
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(one, 1.5, "obs-a"),
++        &[EvidenceCitation { rid: r.clone(), revision: None }],
++        &cfg(),
++    )
++    .unwrap();
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(three, 1.5, "obs-b"),
++        &[
++            EvidenceCitation { rid: r.clone(), revision: None },
++            EvidenceCitation { rid: r2, revision: None },
++            EvidenceCitation { rid: r3, revision: None },
++        ],
++        &cfg(),
++    )
++    .unwrap();
++
++    assert!(
++        (probability(&db, one) - probability(&db, three)).abs() < 1e-12,
++        "one observation with three citations must weigh exactly as much as \
++         the same observation with one: {} vs {}",
++        probability(&db, one),
++        probability(&db, three)
++    );
++}
++
++// ── 3. Reverse: several beliefs on ONE record ────────────────────────
++
++#[test]
++fn one_source_can_carry_several_beliefs() {
++    let db = open_db();
++    let b1 = belief(&db, "api2 has a belief API");
++    let b2 = belief(&db, "api2 is the later candidate");
++    let m = record_in(&db, "194 methods on api2", "a");
++
++    for (b, obs) in [(b1, "obs-1"), (b2, "obs-2")] {
++        db.assert_belief_evidence_with_sources(
++            &evidence_on(b, 1.0, obs),
++            &[EvidenceCitation { rid: m.clone(), revision: None }],
++            &cfg(),
++        )
++        .unwrap();
++    }
++
++    let rows = db.beliefs_for_source(&m, None).unwrap();
++    assert_eq!(rows.len(), 2);
++    let ids: Vec<i64> = rows.iter().map(|r| r.belief_id).collect();
++    assert!(ids.contains(&(b1.to_raw() as i64)) && ids.contains(&(b2.to_raw() as i64)));
++    assert!(rows.iter().all(|r| r.proposition.contains("api2")));
++}
++
++// ── 4. A later correction does not rewrite the citation ──────────────
++
++#[test]
++fn record_correction_marks_drift_without_touching_the_belief() {
++    let db = open_db();
++    let b = belief(&db, "the count is 194");
++    let m = record_in(&db, "Method count: 194", "a");
++
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(b, 2.0, "obs-1"),
++        &[EvidenceCitation { rid: m.clone(), revision: None }],
++        &cfg(),
++    )
++    .unwrap();
++    let before = probability(&db, b);
++
++    db.correct(&m, Some("Method count: 180 (corrected)"), None, None, None, "recount")
++        .unwrap();
++
++    let rows = db.belief_sources(b, None, None).unwrap();
++    assert_eq!(rows.len(), 1);
++    assert_eq!(rows[0].source_revision, 0, "cited revision stays the original");
++    assert_eq!(rows[0].current_revision, 1, "the record moved on");
++    assert!(rows[0].revision_drift, "drift is the signal to review");
++    assert_eq!(rows[0].source_state, "live", "a correction is not a retraction");
++
++    assert!(
++        (probability(&db, b) - before).abs() < 1e-12,
++        "a corrected source flags review; it does not move confidence by itself"
++    );
++}
++
++/// An explicit revision is honoured and stays that number.
++#[test]
++fn explicit_cited_revision_is_kept() {
++    let db = open_db();
++    let b = belief(&db, "pinned to revision two");
++    let m = record_in(&db, "v0", "a");
++    for i in 1..=3 {
++        db.correct(&m, Some(&format!("v{i}")), None, None, None, "edit").unwrap();
++    }
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(b, 1.0, "obs-pinned"),
++        &[EvidenceCitation { rid: m.clone(), revision: Some(2) }],
++        &cfg(),
++    )
++    .unwrap();
++
++    let rows = db.belief_sources(b, None, None).unwrap();
++    assert_eq!(rows[0].source_revision, 2);
++    assert_eq!(rows[0].current_revision, 3);
++    assert!(rows[0].revision_drift);
++}
++
++// ── 5. Retraction keeps the dependency visible ───────────────────────
++
++#[test]
++fn retracted_source_stays_traceable_and_does_not_lower_confidence() {
++    let db = open_db();
++    let b = belief(&db, "the endpoint is v2");
++    let m = record_in(&db, "api2 measurement", "a");
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(b, 2.0, "obs-1"),
++        &[EvidenceCitation { rid: m.clone(), revision: None }],
++        &cfg(),
++    )
++    .unwrap();
++    let before = probability(&db, b);
++
++    db.forget(&m).unwrap();
++
++    let fwd = db.belief_sources(b, None, None).unwrap();
++    assert_eq!(fwd.len(), 1);
++    assert_eq!(fwd[0].source_state, "retracted");
++
++    let rev = db.beliefs_for_source(&m, None).unwrap();
++    assert_eq!(rev.len(), 1, "a withdrawn record must not become invisible");
++    assert_eq!(rev[0].source_state, "retracted");
++
++    assert!(
++        (probability(&db, b) - before).abs() < 1e-12,
++        "withdrawn source = review needed, not refuted"
++    );
++}
++
++// ── 6. Idempotency ───────────────────────────────────────────────────
++
++#[test]
++fn citing_the_same_source_twice_is_idempotent() {
++    let db = open_db();
++    let b = belief(&db, "stable");
++    let m = record_in(&db, "one record", "a");
++
++    for _ in 0..3 {
++        db.assert_belief_evidence_with_sources(
++            &evidence_on(b, 1.0, "obs-same"),
++            &[EvidenceCitation { rid: m.clone(), revision: None }],
++            &cfg(),
++        )
++        .unwrap();
++    }
++
++    let rows = db.belief_sources(b, None, None).unwrap();
++    assert_eq!(rows.len(), 1, "same (belief, observation, record) = one row");
++    // And the evidence entry was revised, not duplicated (0004).
++    let node = db.load_cognitive_node(b).unwrap().unwrap();
++    let crate::state::NodePayload::Belief(p) = &node.payload else { panic!() };
++    assert_eq!(p.evidence_trail.len(), 1);
++}
++
++// ── 7. Unknown source is rejected before anything is written ─────────
++
++#[test]
++fn unknown_source_is_rejected_and_writes_nothing() {
++    let db = open_db();
++    let b = belief(&db, "unchanged");
++    let m = record_in(&db, "real record", "a");
++    let before = probability(&db, b);
++
++    let err = db.assert_belief_evidence_with_sources(
++        &evidence_on(b, 3.0, "obs-bad"),
++        &[
++            EvidenceCitation { rid: m.clone(), revision: None },
++            EvidenceCitation { rid: "does-not-exist".into(), revision: None },
++        ],
++        &cfg(),
++    );
++    assert!(err.is_err(), "a citation must point at a record that existed");
++
++    assert!((probability(&db, b) - before).abs() < 1e-12, "no partial write");
++    assert!(db.belief_sources(b, None, None).unwrap().is_empty());
++    let node = db.load_cognitive_node(b).unwrap().unwrap();
++    let crate::state::NodePayload::Belief(p) = &node.payload else { panic!() };
++    assert!(p.evidence_trail.is_empty());
++}
++
++/// Sources without an observation id cannot be attached to anything.
++#[test]
++fn sources_require_an_observation_id() {
++    let db = open_db();
++    let b = belief(&db, "needs an identity");
++    let m = record_in(&db, "record", "a");
++    let mut ev = evidence_on(b, 1.0, "unused");
++    ev.observation_id = None;
++
++    let err = db.assert_belief_evidence_with_sources(
++        &ev,
++        &[EvidenceCitation { rid: m, revision: None }],
++        &cfg(),
++    );
++    assert!(err.is_err());
++    assert!(db.belief_sources(b, None, None).unwrap().is_empty());
++}
++
++// ── 8. Namespace isolation ───────────────────────────────────────────
++
++#[test]
++fn reverse_lookup_can_be_scoped_to_the_citation_namespace() {
++    let db = open_db();
++    let b1 = belief(&db, "belief in a");
++    let b2 = belief(&db, "belief in b");
++    let ma = record_in(&db, "record in a", "ns-a");
++    let mb = record_in(&db, "record in b", "ns-b");
++
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(b1, 1.0, "obs-a"),
++        &[EvidenceCitation { rid: ma.clone(), revision: None }],
++        &cfg(),
++    )
++    .unwrap();
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(b2, 1.0, "obs-b"),
++        &[EvidenceCitation { rid: mb.clone(), revision: None }],
++        &cfg(),
++    )
++    .unwrap();
++
++    assert_eq!(db.beliefs_for_source(&ma, Some("ns-a")).unwrap().len(), 1);
++    assert!(db.beliefs_for_source(&ma, Some("ns-b")).unwrap().is_empty(),
++            "a namespace-scoped lookup must not leak the other namespace");
++    assert_eq!(db.beliefs_for_source(&ma, None).unwrap().len(), 1);
++    assert_eq!(db.belief_sources(b1, None, Some("ns-a")).unwrap().len(), 1);
++    assert!(db.belief_sources(b1, None, Some("ns-b")).unwrap().is_empty());
++}
++
++// ── 9. Persistence across a process boundary ─────────────────────────
++
++#[test]
++fn provenance_survives_close_and_reopen() {
++    let dir = std::env::temp_dir().join(format!(
++        "ydb-provenance-{}-{:?}",
++        std::process::id(),
++        std::thread::current().id()
++    ));
++    std::fs::create_dir_all(&dir).unwrap();
++    let path = dir.join("store.db");
++    let path_str = path.to_str().unwrap().to_string();
++
++    let (b, m, before) = {
++        let db = YantrikDB::new(&path_str, 8).unwrap();
++        let b = belief(&db, "survives");
++        let m = record_in(&db, "the record", "a");
++        db.assert_belief_evidence_with_sources(
++            &evidence_on(b, 2.0, "obs-persist"),
++            &[
++                EvidenceCitation { rid: m.clone(), revision: None },
++                EvidenceCitation { rid: record_in(&db, "second", "a"), revision: None },
++            ],
++            &cfg(),
++        )
++        .unwrap();
++        let p = probability(&db, b);
++        (b, m, p)
++    };
++
++    let db = YantrikDB::new(&path_str, 8).unwrap();
++    let fwd = db.belief_sources(b, None, None).unwrap();
++    assert_eq!(fwd.len(), 2, "citations are rows, not process state");
++    assert_eq!(fwd[0].observation_id, "obs-persist");
++    let rev = db.beliefs_for_source(&m, None).unwrap();
++    assert_eq!(rev.len(), 1);
++    let node = db.load_cognitive_node(b).unwrap().unwrap();
++    let crate::state::NodePayload::Belief(p) = &node.payload else { panic!() };
++    assert_eq!(p.evidence_trail.len(), 1);
++    assert!((p.probability() - before).abs() < 1e-12);
++    drop(db);
++    std::fs::remove_dir_all(&dir).ok();
++}
++
++// ── 10. Old beliefs without citations stay usable ────────────────────
++
++#[test]
++fn beliefs_without_citations_are_unchanged() {
++    let db = open_db();
++    let b = belief(&db, "no sources at all");
++    db.assert_belief_evidence(&evidence_on(b, 1.0, "obs-plain"), &cfg())
++        .unwrap();
++    assert!(db.belief_sources(b, None, None).unwrap().is_empty());
++    assert!(db.beliefs_for_source("anything", None).unwrap().is_empty());
++    assert!(probability(&db, b) > 0.5);
++}
++
++// ── 11. Eine neue Revision ist keine neue Beobachtung ────────────────
++
++/// A corrected record, re-cited under a fresh observation id, must not vote
++/// again: the observation is the experience, not the revision.
++#[test]
++fn re_citing_a_corrected_record_does_not_vote_twice() {
++    let db = open_db();
++    let b = belief(&db, "the count is 194");
++    let m = record_in(&db, "Method count: 194", "a");
++
++    let first = db
++        .assert_belief_evidence_with_sources(
++            &evidence_on(b, 2.0, "obs-1"),
++            &[EvidenceCitation { rid: m.clone(), revision: None }],
++            &cfg(),
++        )
++        .unwrap()
++        .unwrap();
++    assert_eq!(first.folded_into_observation, None);
++    let p1 = probability(&db, b);
++
++    // The record is corrected (typo). A fresh observation id arrives.
++    db.correct(&m, Some("Method count: 194 (typo fixed)"), None, None, None, "typo")
++        .unwrap();
++    let second = db
++        .assert_belief_evidence_with_sources(
++            &evidence_on(b, 2.0, "obs-2"),
++            &[EvidenceCitation { rid: m.clone(), revision: None }],
++            &cfg(),
++        )
++        .unwrap()
++        .unwrap();
++
++    assert_eq!(
++        second.folded_into_observation.as_deref(),
++        Some("obs-1"),
++        "the call must report which observation it landed in"
++    );
++    assert!(
++        (probability(&db, b) - p1).abs() < 1e-12,
++        "a typo fix in a source must not double the confidence ({} -> {})",
++        p1,
++        probability(&db, b)
++    );
++
++    let node = db.load_cognitive_node(b).unwrap().unwrap();
++    let crate::state::NodePayload::Belief(p) = &node.payload else { panic!() };
++    assert_eq!(p.evidence_trail.len(), 1, "still one observation");
++
++    let rows = db.belief_sources(b, None, None).unwrap();
++    assert_eq!(rows.len(), 1);
++    assert_eq!(rows[0].observation_id, "obs-1", "citation stays where it was made");
++    assert_eq!(rows[0].source_revision, 0, "and keeps the cited revision");
++}
++
++/// The guard must not swallow genuine evidence: a *different* record is a new
++/// observation even for the same belief.
++#[test]
++fn a_different_record_is_still_new_evidence() {
++    let db = open_db();
++    let b = belief(&db, "the count is 194");
++    let m1 = record_in(&db, "Method count: 194", "a");
++    let m2 = record_in(&db, "Second measurement: 194", "a");
++
++    db.assert_belief_evidence_with_sources(
++        &evidence_on(b, 1.0, "obs-1"),
++        &[EvidenceCitation { rid: m1, revision: None }],
++        &cfg(),
++    )
++    .unwrap();
++    let p1 = probability(&db, b);
++
++    let second = db
++        .assert_belief_evidence_with_sources(
++            &evidence_on(b, 1.0, "obs-2"),
++            &[EvidenceCitation { rid: m2, revision: None }],
++            &cfg(),
++        )
++        .unwrap()
++        .unwrap();
++    assert_eq!(second.folded_into_observation, None);
++    assert!(
++        probability(&db, b) > p1,
++        "an independent record is independent evidence"
++    );
++    let node = db.load_cognitive_node(b).unwrap().unwrap();
++    let crate::state::NodePayload::Belief(p) = &node.payload else { panic!() };
++    assert_eq!(p.evidence_trail.len(), 2);
++}
+diff --git a/crates/yantrikdb-core/src/engine/tests/mod.rs b/crates/yantrikdb-core/src/engine/tests/mod.rs
+index 8c563a0..9c43d34 100644
+--- a/crates/yantrikdb-core/src/engine/tests/mod.rs
++++ b/crates/yantrikdb-core/src/engine/tests/mod.rs
+@@ -11,6 +11,7 @@ use self::helpers::*;
+ mod alias_migration;
+ mod backpressure_lifecycle;
+ mod basics;
++mod belief_sources;
+ #[cfg(feature = "bundled-embedder")]
+ mod bound_extraction;
+ mod bundled_embedder;
+diff --git a/crates/yantrikdb-core/src/lib.rs b/crates/yantrikdb-core/src/lib.rs
+index 865480e..b4159c7 100644
+--- a/crates/yantrikdb-core/src/lib.rs
++++ b/crates/yantrikdb-core/src/lib.rs
+@@ -41,6 +41,7 @@ pub use engine::conflict::ConflictBurndownReport;
+ pub use engine::conversation::{Turn, DEFAULT_TURN_WINDOW};
+ pub use engine::demand::KnowledgeGap;
+ pub use engine::digest::{ChangesSince, SessionDigest, SessionDigestConfig, StatusTransition};
++pub use engine::belief_sources::{BeliefSourceRow, EvidenceCitation};
+ pub use engine::graph_ops::AutoRelateReport;
+ pub use engine::graph_ops::{
+     AcceptedClaim, AttachClaimsReport, LearnedRelationPattern, RejectedClaim, StatedClaim,
+diff --git a/crates/yantrikdb-python/src/py_engine/belief_api.rs b/crates/yantrikdb-python/src/py_engine/belief_api.rs
+index 91bdce6..32251f8 100644
+--- a/crates/yantrikdb-python/src/py_engine/belief_api.rs
++++ b/crates/yantrikdb-python/src/py_engine/belief_api.rs
+@@ -15,6 +15,7 @@ use pyo3::types::{PyDict, PyList};
+ type PyObject = pyo3::Py<pyo3::PyAny>;
+ 
+ use yantrikdb_core::belief::{Evidence, EvidenceResult, RevisionSummary};
++use yantrikdb_core::engine::belief_sources::{BeliefSourceRow, EvidenceCitation};
+ use yantrikdb_core::belief_query::{BeliefExplanation, BeliefInventory, BeliefOrder, BeliefPattern};
+ use yantrikdb_core::state::{
+     BeliefPayload, CognitiveAttrs, CognitiveEdge, CognitiveEdgeKind, CognitiveNode, EvidenceEntry,
+@@ -216,6 +217,53 @@ fn evidence_from(
+     }
+ }
+ 
++/// Parse the `sources` argument: a list of rid strings or of
++/// `{"rid": ..., "revision": n?}` dicts. A string means "the revision that is
++/// current when the citation is written".
++fn sources_from(items: Option<&Bound<'_, PyList>>) -> PyResult<Vec<EvidenceCitation>> {
++    let Some(list) = items else {
++        return Ok(Vec::new());
++    };
++    let mut out = Vec::with_capacity(list.len());
++    for item in list.iter() {
++        if let Ok(rid) = item.extract::<String>() {
++            out.push(EvidenceCitation { rid, revision: None });
++            continue;
++        }
++        let d = item.downcast::<PyDict>().map_err(|_| {
++            PyValueError::new_err("each source is a rid string or a dict {rid, revision?}")
++        })?;
++        let rid: String = d
++            .get_item("rid")?
++            .or(d.get_item("source_rid")?)
++            .ok_or_else(|| PyValueError::new_err("source needs 'rid'"))?
++            .extract()?;
++        let revision: Option<u32> = d
++            .get_item("revision")?
++            .filter(|v| !v.is_none())
++            .map(|v| v.extract::<u32>())
++            .transpose()?;
++        out.push(EvidenceCitation { rid, revision });
++    }
++    Ok(out)
++}
++
++fn source_row_into(py: Python<'_>, r: &BeliefSourceRow) -> PyResult<PyObject> {
++    let d = PyDict::new(py);
++    d.set_item("belief_id", r.belief_id)?;
++    d.set_item("proposition", &r.proposition)?;
++    d.set_item("observation_id", &r.observation_id)?;
++    d.set_item("source_rid", &r.source_rid)?;
++    d.set_item("source_revision", r.source_revision)?;
++    d.set_item("current_revision", r.current_revision)?;
++    d.set_item("revision_drift", r.revision_drift)?;
++    d.set_item("namespace", &r.namespace)?;
++    d.set_item("source_state", &r.source_state)?;
++    d.set_item("confidence", r.confidence)?;
++    d.set_item("cited_at", r.cited_at)?;
++    Ok(d.into_any().unbind())
++}
++
+ #[pymethods]
+ impl PyYantrikDB {
+     // ── create / read ──
+@@ -358,7 +406,7 @@ impl PyYantrikDB {
+     /// Assert one observation against a belief. `observation_id` is the stable
+     /// identity of the observation: the same id revises the previous
+     /// assessment instead of voting twice.
+-    #[pyo3(signature = (node_id, weight, source, provenance="observed", propagate=false, timestamp=None, observation_id=None, config=None))]
++    #[pyo3(signature = (node_id, weight, source, provenance="observed", propagate=false, timestamp=None, observation_id=None, config=None, sources=None))]
+     fn belief_assert_evidence(
+         slf: &Bound<'_, Self>,
+         node_id: u32,
+@@ -369,8 +417,10 @@ impl PyYantrikDB {
+         timestamp: Option<f64>,
+         observation_id: Option<String>,
+         config: Option<&Bound<'_, PyDict>>,
++        sources: Option<&Bound<'_, PyList>>,
+     ) -> PyResult<PyObject> {
+         let cfg = config_from(config)?;
++        let srcs = sources_from(sources)?;
+         let ev = evidence_from(
+             node_id,
+             weight,
+@@ -380,7 +430,8 @@ impl PyYantrikDB {
+             timestamp,
+             observation_id,
+         );
+-        let res = Self::detached(slf, move |db| db.assert_belief_evidence(&ev, &cfg))?;
++        let res =
++            Self::detached(slf, move |db| db.assert_belief_evidence_with_sources(&ev, &srcs, &cfg))?;
+         match res {
+             Some(r) => evidence_result_into(slf.py(), &r),
+             None => Ok(slf.py().None()),
+@@ -524,4 +575,52 @@ impl PyYantrikDB {
+         d.set_item("conflicts", res.conflicts.len())?;
+         Ok(d.into_any().unbind())
+     }
++
++    // ── provenance ──
++
++    /// Forward: which records does this belief rest on? Oldest citation first.
++    /// Each row carries the cited revision, the record's current revision, a
++    /// `revision_drift` flag and the source's state
++    /// (`live` | `superseded` | `retracted` | `missing`) — none of which
++    /// changes the belief's confidence.
++    #[pyo3(signature = (node_id, observation_id=None, namespace=None))]
++    fn belief_sources(
++        slf: &Bound<'_, Self>,
++        node_id: u32,
++        observation_id: Option<&str>,
++        namespace: Option<&str>,
++    ) -> PyResult<PyObject> {
++        let obs = observation_id.map(|s| s.to_string());
++        let ns = namespace.map(|s| s.to_string());
++        let rows = Self::detached(slf, move |db| {
++            db.belief_sources(NodeId::from_raw(node_id), obs.as_deref(), ns.as_deref())
++        })?;
++        let out = PyList::empty(slf.py());
++        for r in &rows {
++            out.append(source_row_into(slf.py(), r)?)?;
++        }
++        Ok(out.into_any().unbind())
++    }
++
++    /// Reverse: which beliefs depend on this record? Works for retracted and
++    /// superseded sources too. `namespace` filters on the namespace the
++    /// citation was made in (the source record's, not the belief's — beliefs
++    /// carry no namespace).
++    #[pyo3(signature = (source_rid, namespace=None))]
++    fn beliefs_for_source(
++        slf: &Bound<'_, Self>,
++        source_rid: &str,
++        namespace: Option<&str>,
++    ) -> PyResult<PyObject> {
++        let rid = source_rid.to_string();
++        let ns = namespace.map(|s| s.to_string());
++        let rows = Self::detached(slf, move |db| {
++            db.beliefs_for_source(rid.as_str(), ns.as_deref())
++        })?;
++        let out = PyList::empty(slf.py());
++        for r in &rows {
++            out.append(source_row_into(slf.py(), r)?)?;
++        }
++        Ok(out.into_any().unbind())
++    }
+ }
+-- 
+2.47.3
+

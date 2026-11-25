@@ -1,0 +1,795 @@
+From 33359a9258bfbc57c85f8f7800069e814c4e9a4b Mon Sep 17 00:00:00 2001
+From: Huy3ko <hugundlach@gmail.com>
+Date: Wed, 25 Nov 2026 19:27:55 +0100
+Subject: [PATCH] fix(belief): propagated evidence keeps one voice across
+ several paths
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to the observation identity. A propagated contribution belongs to
+ONE originating observation, but the same observation can reach a belief over
+several graph paths — and until now the entry was keyed by origin only, so the
+path structure was lost:
+
+* per-path state: each path keeps its own weight; the entry's weight is the
+  strongest live path. Withdrawing the strongest path promotes the next one
+  instead of erasing the whole effect.
+* a re-assessed origin lowers the contribution (the path is updated) instead
+  of being ignored as "weaker than what is there".
+* the minimum-propagation-weight guard now only gates NEW propagation, never
+  the correction or withdrawal of a path already recorded.
+* a direct assertion of the same observation already speaks for the belief;
+  its own propagation adds nothing, so one observation is one voice.
+* ties between paths of equal magnitude are broken by source id, so neither
+  the traversal order nor the polarity ordering changes the result.
+
+Wired the origin into the engine path (`assert_belief_evidence` used the
+origin-less variant, so the runtime did not deduplicate at all).
+
+Tests: four new semantics in engine/tests/belief_propagation_identity.rs
+(strongest path withdrawn, origin weakened, direct + propagated, opposite
+polarity); the four existing ones stay green. All 97 belief tests pass, the
+two known-decay tests remain ignored (separate patch).
+---
+ crates/yantrikdb-core/src/cognition/belief.rs |  93 +++++--
+ .../src/cognition/belief_query.rs             |   7 +
+ .../yantrikdb-core/src/cognition/benchmark.rs |   7 +
+ .../src/cognition/contradiction.rs            |   1 +
+ crates/yantrikdb-core/src/cognition/state.rs  | 113 ++++++++
+ crates/yantrikdb-core/src/engine/belief.rs    |  11 +-
+ .../engine/tests/belief_decay_semantics.rs    |   4 +-
+ .../src/engine/tests/belief_propagation.rs    |   2 +-
+ .../tests/belief_propagation_identity.rs      | 245 ++++++++++++++++++
+ crates/yantrikdb-core/src/engine/tests/mod.rs |   1 +
+ 10 files changed, 456 insertions(+), 28 deletions(-)
+ create mode 100644 crates/yantrikdb-core/src/engine/tests/belief_propagation_identity.rs
+
+diff --git a/crates/yantrikdb-core/src/cognition/belief.rs b/crates/yantrikdb-core/src/cognition/belief.rs
+index 751e2dd..6586b0b 100644
+--- a/crates/yantrikdb-core/src/cognition/belief.rs
++++ b/crates/yantrikdb-core/src/cognition/belief.rs
+@@ -284,6 +284,25 @@ pub fn propagate_evidence(
+     downstream_nodes: &mut HashMap<NodeId, CognitiveNode>,
+     config: &BeliefRevisionConfig,
+     hop: u32,
++) -> Vec<PropagationEffect> {
++    propagate_evidence_from(None, source_id, effective_weight, edges, downstream_nodes, config, hop)
++}
++
++/// [`propagate_evidence`] with the originating observation named.
++///
++/// `origin` is the `observation_id` of the evidence that started the
++/// propagation. With it the downstream belief records the contribution under
++/// that origin, so the same observation cannot vote twice — neither across
++/// repeated runs nor across several graph paths (diamond). Without it the old
++/// additive behaviour is kept.
++pub fn propagate_evidence_from(
++    origin: Option<&str>,
++    source_id: NodeId,
++    effective_weight: f64,
++    edges: &[CognitiveEdge],
++    downstream_nodes: &mut HashMap<NodeId, CognitiveNode>,
++    config: &BeliefRevisionConfig,
++    hop: u32,
+ ) -> Vec<PropagationEffect> {
+     if hop >= config.max_propagation_hops {
+         return vec![];
+@@ -310,33 +329,62 @@ pub fn propagate_evidence(
+             * edge.confidence
+             * config.propagation_decay;
+ 
+-        if propagated_weight.abs() < config.min_propagation_weight {
++        let Some(downstream) = downstream_nodes.get_mut(&edge.dst) else {
+             continue;
+-        }
++        };
++        let NodePayload::Belief(belief) = &mut downstream.payload else {
++            continue;
++        };
+ 
+-        // Apply to downstream node
+-        if let Some(downstream) = downstream_nodes.get_mut(&edge.dst) {
+-            if let NodePayload::Belief(belief) = &mut downstream.payload {
+-                let old_lo = belief.log_odds;
++        // With an origin, the contribution is tracked PER PATH: an existing
++        // path may be weakened or withdrawn, so the minimum-weight guard only
++        // gates NEW propagation — never the correction of one already recorded.
++        // Without an origin the old additive behaviour is kept, min-weight
++        // guard included.
++        match origin {
++            None => {
++                if propagated_weight.abs() < config.min_propagation_weight {
++                    continue;
++                }
+                 belief.log_odds += propagated_weight;
+-                belief.log_odds = belief
+-                    .log_odds
+-                    .clamp(-config.max_abs_log_odds, config.max_abs_log_odds);
+-
+-                downstream.attrs.confidence = crate::state::sigmoid(belief.log_odds);
+-
+-                effects.push(PropagationEffect {
+-                    belief_id: edge.dst,
+-                    edge_kind: edge.kind,
+-                    propagated_weight,
+-                    new_log_odds: belief.log_odds,
++            }
++            Some(o) => {
++                // A path that carries nothing either way is a withdrawal. It
++                // must reach the target so it can remove what it propagated
++                // earlier; the minimum-weight guard would swallow it.
++                let key = format!("prop|{o}");
++                let known_path = belief.evidence_trail.iter().any(|e| {
++                    e.observation_id.as_deref() == Some(key.as_str())
++                        && e.paths.iter().any(|(id, _)| *id == source_id)
+                 });
+-
+-                // Don't record in evidence_trail for propagated evidence
+-                // (it's derived, not primary). But do log the change.
+-                let _ = old_lo; // suppress unused warning — change is tracked in effects
++                if !known_path
++                    && ((propagated_weight == 0.0 && effective_weight == 0.0)
++                        || (propagated_weight != 0.0
++                            && propagated_weight.abs() < config.min_propagation_weight))
++                {
++                    continue;
++                }
++                belief.update_propagated(
++                    propagated_weight,
++                    &format!("{:?}", source_id),
++                    edge.last_confirmed_ms as f64 / 1000.0,
++                    o,
++                    source_id,
++                );
+             }
+         }
++        belief.log_odds = belief
++            .log_odds
++            .clamp(-config.max_abs_log_odds, config.max_abs_log_odds);
++
++        downstream.attrs.confidence = crate::state::sigmoid(belief.log_odds);
++
++        effects.push(PropagationEffect {
++            belief_id: edge.dst,
++            edge_kind: edge.kind,
++            propagated_weight,
++            new_log_odds: belief.log_odds,
++        });
+     }
+ 
+     effects
+@@ -606,6 +654,7 @@ mod tests {
+                 timestamp: 1000.0 - 3.0 * 86400.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             });
+         }
+ 
+@@ -628,6 +677,7 @@ mod tests {
+                 timestamp: 1000.0 - 30.0 * 86400.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             });
+         }
+ 
+@@ -659,6 +709,7 @@ mod tests {
+                         timestamp: 1000.0 - 60.0 * 86400.0, // 60 days ago
+                         observation_id: None,
+                         history: Vec::new(),
++                        paths: Vec::new(),
+                     });
+                 }
+                 n
+diff --git a/crates/yantrikdb-core/src/cognition/belief_query.rs b/crates/yantrikdb-core/src/cognition/belief_query.rs
+index 1a4c663..f29b323 100644
+--- a/crates/yantrikdb-core/src/cognition/belief_query.rs
++++ b/crates/yantrikdb-core/src/cognition/belief_query.rs
+@@ -482,6 +482,7 @@ mod tests {
+                 timestamp: 500.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             });
+             b.evidence_trail.push(EvidenceEntry {
+                 source: "afternoon crash".to_string(),
+@@ -489,6 +490,7 @@ mod tests {
+                 timestamp: 700.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             });
+             b.evidence_trail.push(EvidenceEntry {
+                 source: "productivity data".to_string(),
+@@ -496,6 +498,7 @@ mod tests {
+                 timestamp: 900.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             });
+         }
+ 
+@@ -537,6 +540,7 @@ mod tests {
+                 timestamp: 100.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             },
+             EvidenceEntry {
+                 source: "old2".into(),
+@@ -544,6 +548,7 @@ mod tests {
+                 timestamp: 200.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             },
+             EvidenceEntry {
+                 source: "new".into(),
+@@ -551,6 +556,7 @@ mod tests {
+                 timestamp: 800.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             },
+             EvidenceEntry {
+                 source: "new2".into(),
+@@ -558,6 +564,7 @@ mod tests {
+                 timestamp: 900.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             },
+         ];
+ 
+diff --git a/crates/yantrikdb-core/src/cognition/benchmark.rs b/crates/yantrikdb-core/src/cognition/benchmark.rs
+index 04674a5..196cc82 100644
+--- a/crates/yantrikdb-core/src/cognition/benchmark.rs
++++ b/crates/yantrikdb-core/src/cognition/benchmark.rs
+@@ -401,6 +401,7 @@ pub fn build_aisha() -> Result<PersonaScenario> {
+                     timestamp: 1000.0,
+                     observation_id: None,
+                     history: Vec::new(),
++                    paths: Vec::new(),
+                 },
+                 EvidenceEntry {
+                     source: "attending feedback".into(),
+@@ -408,6 +409,7 @@ pub fn build_aisha() -> Result<PersonaScenario> {
+                     timestamp: 2000.0,
+                     observation_id: None,
+                     history: Vec::new(),
++                    paths: Vec::new(),
+                 },
+             ],
+             user_confirmed: true,
+@@ -429,6 +431,7 @@ pub fn build_aisha() -> Result<PersonaScenario> {
+                     timestamp: 1000.0,
+                     observation_id: None,
+                     history: Vec::new(),
++                    paths: Vec::new(),
+                 },
+                 EvidenceEntry {
+                     source: "complained about missed dinner".into(),
+@@ -436,6 +439,7 @@ pub fn build_aisha() -> Result<PersonaScenario> {
+                     timestamp: 3000.0,
+                     observation_id: None,
+                     history: Vec::new(),
++                    paths: Vec::new(),
+                 },
+             ],
+             user_confirmed: false,
+@@ -846,6 +850,7 @@ pub fn build_priya() -> Result<PersonaScenario> {
+                 timestamp: 1000.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             }],
+             user_confirmed: false,
+         }),
+@@ -866,6 +871,7 @@ pub fn build_priya() -> Result<PersonaScenario> {
+                     timestamp: 1000.0,
+                     observation_id: None,
+                     history: Vec::new(),
++                    paths: Vec::new(),
+                 },
+                 EvidenceEntry {
+                     source: "team productivity".into(),
+@@ -873,6 +879,7 @@ pub fn build_priya() -> Result<PersonaScenario> {
+                     timestamp: 2000.0,
+                     observation_id: None,
+                     history: Vec::new(),
++                    paths: Vec::new(),
+                 },
+             ],
+             user_confirmed: true,
+diff --git a/crates/yantrikdb-core/src/cognition/contradiction.rs b/crates/yantrikdb-core/src/cognition/contradiction.rs
+index 2f61da3..769328c 100644
+--- a/crates/yantrikdb-core/src/cognition/contradiction.rs
++++ b/crates/yantrikdb-core/src/cognition/contradiction.rs
+@@ -596,6 +596,7 @@ mod tests {
+                     timestamp: 1000.0 + i as f64,
+                     observation_id: None,
+                     history: Vec::new(),
++                    paths: Vec::new(),
+                 });
+             }
+         }
+diff --git a/crates/yantrikdb-core/src/cognition/state.rs b/crates/yantrikdb-core/src/cognition/state.rs
+index ab7938b..a15b440 100644
+--- a/crates/yantrikdb-core/src/cognition/state.rs
++++ b/crates/yantrikdb-core/src/cognition/state.rs
+@@ -647,9 +647,97 @@ impl BeliefPayload {
+             timestamp,
+             observation_id: observation_id.map(|s| s.to_string()),
+             history: Vec::new(),
++            paths: Vec::new(),
+         });
+     }
+ 
++    /// Apply a PROPAGATED contribution that is derived from one originating
++    /// observation, arriving over ONE graph path (`via` = the belief the path
++    /// came from).
++    ///
++    /// Four properties, each the answer to a measured defect:
++    /// * **idempotent** — the same origin over the same path does not add a
++    ///   second vote, however often the run repeats;
++    /// * **one voice per observation** — several paths carrying the same
++    ///   observation contribute ONE aggregate: the strongest live path. A
++    ///   second, weaker path adds nothing, and the result does not depend on
++    ///   the order in which paths are walked;
++    /// * **per-path withdrawal** — withdrawing the strongest path demotes the
++    ///   aggregate to the next live path instead of erasing the effect; a
++    ///   path withdrawn with weight 0.0 leaves the others standing;
++    /// * **weakening is a re-assessment** — the same path arriving with a
++    ///   smaller magnitude lowers the aggregate (the origin evidence was
++    ///   re-evaluated, not retracted).
++    ///
++    /// A direct assertion of the same observation already speaks for this
++    /// belief (it is about the belief itself, propagation is derived from it),
++    /// so propagation of an origin that is present as direct evidence adds
++    /// nothing here.
++    ///
++    /// The entry keeps the origin in `observation_id` (`prop|<origin>|…`), so
++    /// the propagated effect stays distinguishable from direct evidence.
++    pub fn update_propagated(
++        &mut self,
++        weight: f64,
++        source: &str,
++        timestamp: f64,
++        origin: &str,
++        via: NodeId,
++    ) {
++        let entry_key = format!("prop|{origin}");
++        // The direct assertion of this observation is primary; propagation is
++        // derived from it and must not vote a second time.
++        let already_direct = self
++            .evidence_trail
++            .iter()
++            .any(|e| e.observation_id.as_deref() == Some(origin));
++        let weight = if already_direct { 0.0 } else { weight };
++
++        let Some(idx) = self
++            .evidence_trail
++            .iter()
++            .position(|e| e.observation_id.as_deref() == Some(entry_key.as_str()))
++        else {
++            // No entry yet: a retraction has nothing to withdraw.
++            if weight == 0.0 {
++                return;
++            }
++            self.log_odds += weight;
++            self.evidence_trail.push(EvidenceEntry {
++                source: source.to_string(),
++                weight,
++                timestamp,
++                observation_id: Some(entry_key),
++                history: Vec::new(),
++                paths: vec![(via, weight)],
++            });
++            return;
++        };
++
++        let entry = &mut self.evidence_trail[idx];
++        // Upsert this path. A path withdrawn with weight 0.0 disappears, so it
++        // can no longer hold the aggregate up.
++        if let Some(p) = entry.paths.iter_mut().find(|(id, _)| *id == via) {
++            if weight == 0.0 {
++                entry.paths.retain(|(id, _)| *id != via);
++            } else {
++                p.1 = weight;
++            }
++        } else if weight != 0.0 {
++            entry.paths.push((via, weight));
++        }
++
++        let aggregate = strongest_path(&entry.paths);
++        if aggregate == entry.weight {
++            entry.source = source.to_string();
++            return;
++        }
++        entry.history.push((entry.weight, entry.timestamp));
++        self.log_odds += aggregate - entry.weight;
++        entry.weight = aggregate;
++        entry.source = source.to_string();
++    }
++
+     /// How much evidence supports this belief (sum of positive weights).
+     pub fn support_strength(&self) -> f64 {
+         self.evidence_trail
+@@ -669,6 +757,23 @@ impl BeliefPayload {
+     }
+ }
+ 
++/// The aggregate a set of paths contributes: the one with the largest
++/// magnitude. Ties are broken by the source belief's id, so the result never
++/// depends on the order the graph was walked in.
++fn strongest_path(paths: &[(NodeId, f64)]) -> f64 {
++    let mut best: Option<(NodeId, f64)> = None;
++    for &(via, w) in paths {
++        best = match best {
++            None => Some((via, w)),
++            Some((bvia, bw)) => {
++                let strengthens = w.abs() > bw.abs() || (w.abs() == bw.abs() && via.to_raw() < bvia.to_raw());
++                if strengthens { Some((via, w)) } else { Some((bvia, bw)) }
++            }
++        };
++    }
++    best.map(|(_, w)| w).unwrap_or(0.0)
++}
++
+ /// A single piece of evidence for or against a belief.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct EvidenceEntry {
+@@ -691,6 +796,13 @@ pub struct EvidenceEntry {
+     /// here, so the current state and its development stay distinguishable.
+     #[serde(default)]
+     pub history: Vec<(f64, f64)>,
++    /// For a PROPAGATED entry: the individual graph paths that carried this
++    /// observation here, as `(source belief, weight)`. `weight` above is the
++    /// aggregate the belief actually uses — the strongest live path — so
++    /// withdrawing one path promotes the next one instead of erasing the
++    /// whole effect. Empty for directly asserted evidence.
++    #[serde(default)]
++    pub paths: Vec<(NodeId, f64)>,
+ }
+ 
+ /// Goal: a desired future state.
+@@ -2075,6 +2187,7 @@ mod tests {
+                 timestamp: 1000.0,
+                 observation_id: None,
+                 history: Vec::new(),
++                paths: Vec::new(),
+             }],
+             user_confirmed: true,
+         });
+diff --git a/crates/yantrikdb-core/src/engine/belief.rs b/crates/yantrikdb-core/src/engine/belief.rs
+index e675357..a5f6cb7 100644
+--- a/crates/yantrikdb-core/src/engine/belief.rs
++++ b/crates/yantrikdb-core/src/engine/belief.rs
+@@ -7,8 +7,8 @@
+ use std::collections::HashMap;
+ 
+ use crate::belief::{
+-    self, apply_staleness_decay, assert_evidence, propagate_evidence, BeliefRevisionConfig,
+-    Evidence, EvidenceResult, RevisionSummary,
++    self, apply_staleness_decay, assert_evidence, propagate_evidence, propagate_evidence_from,
++    BeliefRevisionConfig, Evidence, EvidenceResult, RevisionSummary,
+ };
+ use crate::belief_query::{self, BeliefExplanation, BeliefInventory, BeliefPattern};
+ use crate::contradiction::{self, ContradictionConfig, ContradictionScanResult};
+@@ -70,8 +70,11 @@ impl YantrikDB {
+                     }
+                 }
+ 
+-                // Propagate
+-                let effects = propagate_evidence(
++                // Propagate. The origin travels with the evidence so the same
++                // observation cannot vote twice downstream — neither across
++                // repeated runs nor across several graph paths.
++                let effects = propagate_evidence_from(
++                    evidence.observation_id.as_deref(),
+                     evidence.target_belief,
+                     result.effective_weight,
+                     &epistemic_edges,
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs b/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
+index 6317798..19b5700 100644
+--- a/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
++++ b/crates/yantrikdb-core/src/engine/tests/belief_decay_semantics.rs
+@@ -33,7 +33,7 @@ fn lo(n: &CognitiveNode) -> f64 {
+ fn repeated_revision_at_same_time_is_idempotent() {
+     let cfg = BeliefRevisionConfig::default();
+     let now = 1_800_000_000.0_f64;
+-    let trail = vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: now - 60.0 * 86400.0, observation_id: None, history: Vec::new() }];
++    let trail = vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: now - 60.0 * 86400.0, observation_id: None, history: Vec::new(), paths: Vec::new(),}];
+     let mut a = belief(21, trail.clone(), 2.0);
+     let mut b = belief(22, trail, 2.0);
+ 
+@@ -58,7 +58,7 @@ fn repeated_revision_at_same_time_is_idempotent() {
+ fn decay_follows_elapsed_time_not_call_count() {
+     let cfg = BeliefRevisionConfig::default();
+     let t0 = 1_800_000_000.0_f64;
+-    let mk = |seq| belief(seq, vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: t0 - 60.0 * 86400.0, observation_id: None, history: Vec::new() }], 2.0);
++    let mk = |seq| belief(seq, vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: t0 - 60.0 * 86400.0, observation_id: None, history: Vec::new(), paths: Vec::new(),}], 2.0);
+ 
+     // A: ein Aufruf, 30 Tage nach t0
+     let mut a = mk(23);
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs b/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
+index 93b2932..5d4adc0 100644
+--- a/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
++++ b/crates/yantrikdb-core/src/engine/tests/belief_propagation.rs
+@@ -105,7 +105,7 @@ fn revise_beliefs_decays_stale_evidence() {
+     let mut b = belief(
+         17,
+         "Nur alte Belege.",
+-        vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: old, observation_id: None, history: Vec::new() }],
++        vec![EvidenceEntry { source: "alt".into(), weight: 2.0, timestamp: old, observation_id: None, history: Vec::new(), paths: Vec::new(),}],
+     );
+     if let NodePayload::Belief(p) = &mut b.payload {
+         p.log_odds = 2.0;
+diff --git a/crates/yantrikdb-core/src/engine/tests/belief_propagation_identity.rs b/crates/yantrikdb-core/src/engine/tests/belief_propagation_identity.rs
+new file mode 100644
+index 0000000..2f9a9c3
+--- /dev/null
++++ b/crates/yantrikdb-core/src/engine/tests/belief_propagation_identity.rs
+@@ -0,0 +1,245 @@
++use super::*;
++use crate::belief::{propagate_evidence_from, BeliefRevisionConfig};
++use crate::state::{BeliefPayload, CognitiveEdge, CognitiveEdgeKind};
++use crate::{CognitiveNode, NodeId, NodeKind, NodePayload};
++use std::collections::HashMap;
++
++fn belief(seq: u32) -> CognitiveNode {
++    let id = NodeId::new(NodeKind::Belief, seq);
++    CognitiveNode::new(
++        id,
++        format!("b{seq}"),
++        NodePayload::Belief(BeliefPayload {
++            proposition: "Probe.".into(),
++            log_odds: 0.0,
++            domain: "general".into(),
++            evidence_trail: Vec::new(),
++            user_confirmed: false,
++        }),
++    )
++}
++
++fn lo(n: &CognitiveNode) -> f64 {
++    match &n.payload { NodePayload::Belief(b) => b.log_odds, _ => panic!() }
++}
++
++fn entries(n: &CognitiveNode) -> usize {
++    match &n.payload { NodePayload::Belief(b) => b.evidence_trail.len(), _ => 0 }
++}
++
++fn edge(src: NodeId, dst: NodeId) -> CognitiveEdge {
++    CognitiveEdge {
++        src, dst, kind: CognitiveEdgeKind::Supports, weight: 1.0,
++        created_at_ms: 1_800_000_000_000, last_confirmed_ms: 1_800_000_000_000,
++        observation_count: 1, confidence: 1.0,
++    }
++}
++
++/// Wiederholte Propagation derselben Ursprungsbeobachtung zählt einmal.
++#[test]
++fn repeated_propagation_with_origin_is_idempotent() {
++    let cfg = BeliefRevisionConfig::default();
++    let a = belief(41);
++    let d = belief(42);
++    let (ai, di) = (a.id, d.id);
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(di, d);
++
++    let _ = propagate_evidence_from(Some("obs-1"), ai, 1.0, &[edge(ai, di)], &mut down, &cfg, 0);
++    let once = lo(&down[&di]);
++    let _ = propagate_evidence_from(Some("obs-1"), ai, 1.0, &[edge(ai, di)], &mut down, &cfg, 0);
++    let twice = lo(&down[&di]);
++    println!("WIEDERHOLT: einmal={once:.4} zweimal={twice:.4} trail={}", entries(&down[&di]));
++    assert!((once - twice).abs() < 1e-12, "same origin must not vote twice");
++    assert_eq!(entries(&down[&di]), 1);
++}
++
++/// Diamond: dieselbe Ursprungsbeobachtung erreicht das Ziel über zwei Beliefs.
++/// Sie darf dort EINE Erfahrung bleiben, und der stärkere Pfad gewinnt.
++#[test]
++fn diamond_counts_the_origin_once_and_keeps_the_stronger_path() {
++    let cfg = BeliefRevisionConfig::default();
++    let a = belief(43); let b = belief(44); let c = belief(45); let d = belief(46);
++    let (ai, bi, ci, di) = (a.id, b.id, c.id, d.id);
++
++    // Hop 1: A -> B (stark), A -> C (schwach)
++    let mut hop1: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    hop1.insert(bi, b.clone());
++    hop1.insert(ci, c);
++    let _ = propagate_evidence_from(Some("obs-diamond"), ai, 1.0, &[edge(ai, bi), edge(ai, ci)], &mut hop1, &cfg, 0);
++    let w_b = lo(&hop1[&bi]);
++    let w_c = lo(&hop1[&ci]);
++
++    // Hop 2: B -> D, C -> D, beide mit demselben Ursprung
++    let mut hop2: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    hop2.insert(di, d);
++    let _ = propagate_evidence_from(Some("obs-diamond"), bi, w_b, &[edge(bi, di)], &mut hop2, &cfg, 1);
++    let after_first_path = lo(&hop2[&di]);
++    // zweiter Pfad bewusst schwächer: halbes Kantengewicht
++    let mut weak = edge(ci, di); weak.weight = 0.5;
++    let _ = propagate_evidence_from(Some("obs-diamond"), ci, w_c, &[weak], &mut hop2, &cfg, 1);
++    let after_second_path = lo(&hop2[&di]);
++
++    println!("DIAMOND: Pfad B={w_b:.4} Pfad C={w_c:.4} · nach 1. Pfad {after_first_path:.4} · nach 2. Pfad {after_second_path:.4} · trail={}",
++             entries(&hop2[&di]));
++    assert_eq!(entries(&hop2[&di]), 1, "the diamond must hold one observation, not two");
++    assert!((after_second_path - after_first_path).abs() < 1e-12,
++            "a weaker second path must not add to the first");
++}
++
++/// Rücknahme: die Ursprungsbeobachtung auf 0 zurücknehmen korrigiert die propagierte Wirkung.
++#[test]
++fn retracting_the_origin_corrects_the_propagated_effect() {
++    let cfg = BeliefRevisionConfig::default();
++    let a = belief(47); let d = belief(48);
++    let (ai, di) = (a.id, d.id);
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(di, d);
++
++    let _ = propagate_evidence_from(Some("obs-retract"), ai, 1.0, &[edge(ai, di)], &mut down, &cfg, 0);
++    let with_evidence = lo(&down[&di]);
++    let _ = propagate_evidence_from(Some("obs-retract"), ai, 0.0, &[edge(ai, di)], &mut down, &cfg, 0);
++    let after_retraction = lo(&down[&di]);
++    println!("RÜCKNAHME: {with_evidence:.4} -> {after_retraction:.4} trail={}", entries(&down[&di]));
++    assert!(after_retraction.abs() < 1e-12, "retraction must remove the propagated contribution");
++    assert_eq!(entries(&down[&di]), 1, "the entry stays, its weight becomes 0");
++}
++
++/// Ohne Ursprung bleibt das alte Verhalten (additiv) — Rückwärtskompatibilität.
++#[test]
++fn without_origin_propagation_stays_additive() {
++    let cfg = BeliefRevisionConfig::default();
++    let a = belief(49); let d = belief(50);
++    let (ai, di) = (a.id, d.id);
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(di, d);
++    let _ = propagate_evidence_from(None, ai, 1.0, &[edge(ai, di)], &mut down, &cfg, 0);
++    let once = lo(&down[&di]);
++    let _ = propagate_evidence_from(None, ai, 1.0, &[edge(ai, di)], &mut down, &cfg, 0);
++    let twice = lo(&down[&di]);
++    println!("OHNE URSPRUNG: einmal={once:.4} zweimal={twice:.4}");
++    assert!((twice - 2.0 * once).abs() < 1e-12);
++}
++
++fn with_weight(src: NodeId, dst: NodeId, weight: f64) -> CognitiveEdge {
++    let mut e = edge(src, dst);
++    e.weight = weight;
++    e
++}
++
++fn contradicting(src: NodeId, dst: NodeId, weight: f64) -> CognitiveEdge {
++    let mut e = edge(src, dst);
++    e.kind = CognitiveEdgeKind::Contradicts;
++    e.weight = weight;
++    e
++}
++
++/// Der stärkste Pfad wird zurückgenommen — der schwächere gültige bleibt stehen.
++///
++/// Vor dem Fix lag pro Ursprung EIN Beitrag im Trail: die Rücknahme des starken
++/// Pfades löschte auch den schwachen, obwohl der weiter gültig war.
++#[test]
++fn withdrawing_the_strongest_path_promotes_the_weaker_one() {
++    let cfg = BeliefRevisionConfig::default();
++    let b = belief(51);
++    let c = belief(52);
++    let d = belief(53);
++    let (bi, ci, di) = (b.id, c.id, d.id);
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(di, d);
++
++    // zwei Pfade, eine Ursprungsbeobachtung: B trägt 0,5 · C trägt 0,2
++    let _ = propagate_evidence_from(Some("obs-zwei-pfade"), bi, 1.0, &[edge(bi, di)], &mut down, &cfg, 0);
++    let _ = propagate_evidence_from(Some("obs-zwei-pfade"), ci, 1.0, &[with_weight(ci, di, 0.4)], &mut down, &cfg, 0);
++    let both = lo(&down[&di]);
++
++    // stärksten Pfad zurücknehmen
++    let _ = propagate_evidence_from(Some("obs-zwei-pfade"), bi, 0.0, &[edge(bi, di)], &mut down, &cfg, 0);
++    let after = lo(&down[&di]);
++
++    println!("RÜCKNAHME STARKER PFAD: beide={both:.4} · nach Rücknahme={after:.4} trail={}", entries(&down[&di]));
++    assert!((both - 0.5).abs() < 1e-12, "the stronger path must carry the aggregate");
++    assert!((after - 0.2).abs() < 1e-12, "the weaker valid path must remain");
++    assert_eq!(entries(&down[&di]), 1, "still one observation, not two");
++}
++
++/// Die Ursprungsbeobachtung wird schwächer bewertet, ohne zurückgenommen zu werden.
++#[test]
++fn weakening_the_origin_lowers_the_propagated_effect() {
++    let cfg = BeliefRevisionConfig::default();
++    let b = belief(54);
++    let d = belief(55);
++    let (bi, di) = (b.id, d.id);
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(di, d);
++
++    let _ = propagate_evidence_from(Some("obs-neubewertung"), bi, 1.0, &[edge(bi, di)], &mut down, &cfg, 0);
++    let strong = lo(&down[&di]);
++    let _ = propagate_evidence_from(Some("obs-neubewertung"), bi, 0.4, &[edge(bi, di)], &mut down, &cfg, 0);
++    let weakened = lo(&down[&di]);
++
++    println!("ABSCHWÄCHUNG: {strong:.4} -> {weakened:.4} trail={}", entries(&down[&di]));
++    assert!((strong - 0.5).abs() < 1e-12);
++    assert!((weakened - 0.2).abs() < 1e-12, "a re-assessed origin must lower the contribution, not keep or erase it");
++    assert_eq!(entries(&down[&di]), 1);
++}
++
++/// Dieselbe Beobachtung erreicht einen Belief direkt UND über Propagation.
++#[test]
++fn direct_evidence_outranks_its_own_propagation() {
++    let cfg = BeliefRevisionConfig::default();
++    let a = belief(56);
++    let mut d = belief(57);
++    let (ai, di) = (a.id, d.id);
++
++    // direkt: dieselbe Beobachtungsidentität liegt schon am Ziel
++    if let NodePayload::Belief(p) = &mut d.payload {
++        p.update_with_id(0.3, 1.0, "direkt", 1_800_000_000.0, Some("obs-direkt-und-pfad"));
++    }
++    let direct = lo(&d);
++
++    let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++    down.insert(di, d);
++    let _ = propagate_evidence_from(Some("obs-direkt-und-pfad"), ai, 1.0, &[edge(ai, di)], &mut down, &cfg, 0);
++    let after = lo(&down[&di]);
++
++    println!("DIREKT + PROPAGIERT: direkt={direct:.4} danach={after:.4} trail={}", entries(&down[&di]));
++    assert!((after - direct).abs() < 1e-12, "the same observation must not vote twice");
++    assert_eq!(entries(&down[&di]), 1, "only the direct entry speaks");
++}
++
++/// Zwei Pfade tragen dieselbe Beobachtung mit ENTGEGENGESETZTER Polarität.
++/// Eine Beobachtung hat eine Stimme — die stärkere Aussage — und die Reihenfolge
++/// der Pfade darf das Ergebnis nicht ändern.
++#[test]
++fn opposite_polarity_paths_speak_with_one_voice() {
++    let cfg = BeliefRevisionConfig::default();
++
++    let run = |support_first: bool| -> f64 {
++        let b = belief(58);
++        let c = belief(59);
++        let d = belief(60);
++        let (bi, ci, di) = (b.id, c.id, d.id);
++        let mut down: HashMap<NodeId, CognitiveNode> = HashMap::new();
++        down.insert(di, d);
++        let supports = edge(bi, di);            // +0,5
++        let contradicts = contradicting(ci, di, 1.6); // -0,8
++        let order: Vec<(NodeId, CognitiveEdge)> = if support_first {
++            vec![(bi, supports), (ci, contradicts)]
++        } else {
++            vec![(ci, contradicts), (bi, supports)]
++        };
++        for (src, e) in order {
++            let _ = propagate_evidence_from(Some("obs-polaritaet"), src, 1.0, &[e], &mut down, &cfg, 0);
++        }
++        println!("POLARITÄT (support_first={support_first}): {:.4}", lo(&down[&di]));
++        entries(&down[&di]);
++        lo(&down[&di])
++    };
++
++    let a = run(true);
++    let b = run(false);
++    println!("POLARITÄT: erst stützend={a:.4} · erst widersprechend={b:.4}");
++    assert!((a - b).abs() < 1e-12, "the order of the paths must not matter");
++    assert!((a + 0.8).abs() < 1e-12, "the stronger statement carries the aggregate");
++}
+diff --git a/crates/yantrikdb-core/src/engine/tests/mod.rs b/crates/yantrikdb-core/src/engine/tests/mod.rs
+index 98b3443..049afed 100644
+--- a/crates/yantrikdb-core/src/engine/tests/mod.rs
++++ b/crates/yantrikdb-core/src/engine/tests/mod.rs
+@@ -56,6 +56,7 @@ mod belief_lifecycle;
+ mod belief_propagation;
+ mod belief_decay_semantics;
+ mod evidence_identity_semantics;
++mod belief_propagation_identity;
+ mod reembed_router;
+ #[cfg(feature = "bundled-embedder")]
+ mod reextract_claims;
+-- 
+2.47.3
+
