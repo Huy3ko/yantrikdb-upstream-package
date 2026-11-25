@@ -1,37 +1,32 @@
-From d32f2195b39207b55cc2b64a6e415bacaf0c7870 Mon Sep 17 00:00:00 2001
-From: Huy3ko <hugundlach@gmail.com>
-Date: Wed, 25 Nov 2026 20:08:05 +0100
-Subject: [PATCH] feat(python): the native belief lifecycle is reachable from
- Python
+From bd0edc05d6942c34207ee84cbad5d628ba15f6c8 Mon Sep 17 00:00:00 2001
+From: Huy3ko <224625040+Huy3ko@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:55:02 +0100
+Subject: [PATCH] feat(python): expose the native belief lifecycle to Python
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-The engine had the whole lifecycle — create, query, evidence with identity,
-re-assessment, propagation, explain, decay — and the Python bindings exposed
-none of it (measured: no attribute containing "belief" on YantrikDB).
+The engine has the whole loop — create, evidence with stable identity,
+re-assessment, propagation, explain, time-based decay — and the Python
+bindings exposed none of it (measured: no attribute containing "belief" on
+YantrikDB). An agent could not drive the loop even though the machine was
+complete.
 
 This is a mapping, not a second implementation: every semantic stays in
-yantrikdb_core. Two small native additions were needed and are deliberately
-minimal:
+yantrikdb_core. Two small native additions were needed:
 
 * `create_belief` — node creation belongs where the persisted NodeIdAllocator
   lives; a caller cannot allocate an id that survives a restart.
-* `revise_all_beliefs_at(now_secs, ..)` — the existing pass with the clock
-  supplied; `revise_all_beliefs` now delegates with `now()`. Without it a
-  time-based measurement is not deterministic (two runs a microsecond apart are
-  two instants).
+* `revise_all_beliefs_at(now, ..)` — the existing pass with the clock supplied;
+  `revise_all_beliefs` delegates with `now()`. Without it a time-based
+  measurement is not deterministic.
 
-Bindings added (py_engine/belief_api.rs): belief_create, belief_get,
-belief_query, belief_inventory, belief_assert_evidence,
-belief_assert_evidence_batch, belief_explain, belief_relate, belief_edges,
-belief_confirm, belief_refute, belief_revise, belief_contradictions.
-`belief_get` returns the trail with each observation's earlier assessments
-(`history`) and the per-path contributions of propagated origins (`paths`).
+Depends on the three preceding commits (evidence identity, propagation origin,
+decay anchor): the binding reads the fields they introduce.
 
-Acceptance: the Rust two-process lifecycle reproduced over Python (create,
-identity, propagation, re-assessment with history, explain, fixed-clock decay,
-restart, re-assert, query) — see ABNAHME-PYTHON-20261125.md.
+Verified on this tree: 13 belief_* methods reachable; asserting the same
+observation twice revises (probability unchanged, trail stays 1); library suite
+2,307 passed / 0 failed.
 ---
  crates/yantrikdb-core/src/engine/belief.rs    |  57 +-
  .../src/py_engine/belief_api.rs               | 527 ++++++++++++++++++

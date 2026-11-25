@@ -16,9 +16,9 @@ they are listed here with their status so nothing is duplicated.
 | 0002 | redundancy scan gated behind `run_conflict_scan` | PR #311 |
 | 0004–0006 | belief evidence: identity, one voice, time-based decay (3 commits) | PR #313 |
 | 0008 | `what_changed_since` reports chain status, not a default | PR #310 |
-| 0003 | Hermes plugin: personality telemetry not derived as persona | **prepared**, other repository |
-| 0007 | native belief lifecycle over Python | **prepared**, depends on 0004–0006 |
-| 0009 | evidence provenance in both directions | **experimental**, depends on 0007; open design decision |
+| 0003 | Hermes plugin: personality telemetry not derived as persona | **closed — already fixed upstream** (`run_personality=False` is the default and the only call site) |
+| 0007 | native belief lifecycle over Python | **prepared, not submitted** — depends on **#313**; branch `fix/belief-python-api`, commit `bd0edc0` |
+| 0009 | evidence provenance in both directions | **experimental**, depends on 0007; open design decision (record vs. observation identity) |
 | A, C | supersedes/derived-from for beliefs, belief as-of | **design only**, no code |
 
 `patches/` holds one patch per candidate. `pr-texts/` holds the text submitted
