@@ -85,3 +85,20 @@ from the tree: it prints `DEFEKT REPRODUZIERT` before the patch and
 No memory contents, no database dumps, no deployment details. Measured numbers
 are from synthetic stores built by the tests, except where a patch text says
 "production store" — those are counts only, with no records.
+
+## 0010 — substitution categories indexed (perf)
+
+`patches/0010-substitution-index.patch` · `pr-texts/PR-0010.md` · `reproducers/substitution_index_bench.rs`
+
+`check_redundancy_in_namespace` issued one JOIN per token pair of every
+near-duplicate memory pair. The table (8 categories, 80 members) is now loaded
+once per namespace and the same predicate is answered in memory.
+
+Same corpus, same binary, built from `3d52394` and from the branch:
+parent `> 300 s` (timeout), change `1.242 s`, same 40 triggers. On a
+24,268-record store: 116 s (unfinished) → 0.531 s, `think()` >25 min → 2.01 s.
+
+Nothing is gated or disabled. PR: https://github.com/yantrikos/yantrikdb/pull/315
+Note: #312 must rebase onto this and move its subject/frame predicate into
+`check_substitution_pair_in_index`, or it edits a function the redundancy path
+no longer calls.
